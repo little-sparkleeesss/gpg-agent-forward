@@ -1,0 +1,17 @@
+# Build output. Rebuild with:
+#   CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
+#     -ldflags "-s -w" -o dist/gpg-agent-forward-windows-amd64.exe ./cmd/gpg-agent-forward
+dist/
+
+# Local scratch
+*.exe
+*.test
+*.out
+
+# Go toolchain telemetry, written here when a build runs with HOME pointed at
+# the repo root (e.g. in a container). Never project content.
+.config/
+
+# Vendored dependencies. The module cache is the source of truth; run
+# `go mod download` (or just build) to fetch them from the proxy.
+vendor/
