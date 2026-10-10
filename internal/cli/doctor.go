@@ -95,12 +95,17 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 		report("agent handshake", gErr, " ("+trimGreeting(greeting)+")")
 	}
 
-	// peer check没法在非Windows上演练, 因此要报告它是否启用, 是否真能工作.
-	if err := selfPeerCheck(); err != nil {
-		ok = false
-		fmt.Fprintf(stdout, "  FAIL  peer check: %v\n", err)
+	// peer策略只存在于Windows relay, 非Windows报n/a: 否则等于说没测过的策略已验证.
+	if peerCheckSupported() {
+		policyErr, liveErr := selfPeerCheck()
+		report("peer check", policyErr, "")
+		// live腿只证明检查能在真实连接上跑; 得不出结论 (如TCP表瞬时缺条目) 只是note, 不是
+		// FAIL: 能证明策略坏掉的只有策略检查本身.
+		if liveErr != nil {
+			fmt.Fprintf(stdout, "  note  peer check on a live connection reached no verdict: %v\n", liveErr)
+		}
 	} else {
-		fmt.Fprintln(stdout, "  ok    peer check available")
+		fmt.Fprintln(stdout, "  n/a   peer check (Windows only)")
 	}
 
 	if *port > 0 {
@@ -134,14 +139,15 @@ func trimTrailingNewline(s string) string {
 	return s
 }
 
-// `selfPeerCheck`对合成peer跑策略检查, 因为活体探测证明不了策略: 本进程自己的连接按
-// 设计总是放行, 无论比较是否写反都返回nil.
-func selfPeerCheck() error {
+// `selfPeerCheck`返回策略检查的错误 (必须让doctor失败) 和live腿的错误 (仅供参考).
+// 策略对合成peer检查, 因为活体探测证明不了它: 本进程自己的连接按设计总是放行,
+// 无论比较是否写反都返回nil.
+func selfPeerCheck() (policyErr, liveErr error) {
 	if err := peerPolicyCheck(); err != nil {
-		return err
+		return err, nil
 	}
-	// 再在真实连接上端到端确认机制本身能跑, 本机查询失败要报告而不是假定.
-	return selfPeerCheckConn()
+	// 再在真实连接上端到端确认机制能跑: 本机查询失败只报note, 不当成策略坏掉的证据.
+	return nil, selfPeerCheckConn()
 }
 
 // `selfPeerCheckConn`对本进程自连的连接跑peer检查, 只有得不出结论才报错.
@@ -177,7 +183,8 @@ func selfPeerCheckConn() error {
 	}
 }
 
-// `selfPeerCheckResult`: 有结论 (放行或拒绝) 返回nil, 只有检查本身坏了才报错.
+// `selfPeerCheckResult`: 有结论 (`nil`放行, `ErrPeerNotAllowed`识别后拒绝) 返回nil;
+// 其他错误即没结论 (查询或身份失败), 交doctor报note.
 func selfPeerCheckResult(err error) error {
 	if err == nil || errors.Is(err, winpeer.ErrPeerNotAllowed) {
 		return nil

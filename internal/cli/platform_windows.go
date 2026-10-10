@@ -27,3 +27,6 @@ func newLogger(w io.Writer) *log.Logger {
 
 // 用本进程自身身份跑一遍relay的对端策略, 让doctor能验证策略真的生效.
 func peerPolicyCheck() error { return winpeer.PolicyCheckSelf() }
+
+// 对端策略只在Windows上生效 (连接经loopback端口到达), doctor的对端检查也只在那里有意义.
+func peerCheckSupported() bool { return true }
