@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -62,9 +61,11 @@ Common options:
                        (default %LOCALAPPDATA%\gnupg\S.gpg-agent.extra)
   --port N             loopback port used between the relay and ssh
                        (default 29173)
-  --idle DURATION      exit after this long with no connection
-                       (default 15m; 0 disables; ignored by ssh, which ties
-                       the relay's lifetime to the session)
+  --idle DURATION      serve/ensure: exit after this long with no connection
+                       (default 15m; 0 disables)
+                       ssh accepts this option and ignores it: a relay used by
+                       an ssh session is always started with the idle timeout
+                       disabled, and its lifetime is tied to the session
   --remote-socket PATH ssh only: socket path to create on the remote host
                        (default: whatever gpgconf --list-dirs agent-socket reports)
 
@@ -150,6 +151,10 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	port := fs.Int("port", DefaultRelayPort, "loopback port for ssh to dial")
 	remoteSocket := fs.String("remote-socket", "",
 		"socket path to create on the remote host (default: ask the remote for `gpgconf --list-dirs agent-socket`)")
+	// idle选项被接受但忽略: ssh会话用的relay总是禁用idle, 因为relay无法感知
+	// 会话结束; 这里必须消费掉它, 否则会透传给ssh而被它拒绝, 会话根本起不来.
+	fs.Duration("idle", 0,
+		"accepted and ignored: a relay serving an ssh session is always started with the idle timeout disabled")
 	if err := fs.Parse(own); err != nil {
 		return err
 	}
@@ -179,21 +184,26 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	// 从这里起的诊断 (下面这行, ssh的stderr, watchdog) 都走同一把锁,
+	// 调用方传入的writer不必自己保证并发安全.
+	errOut := &syncWriter{w: stderr}
+
 	stopRelay, err := EnsureRelay(selfExe(), *socketFile, *port, 0)
 	if err != nil {
 		return err
 	}
-	// relay无法感知ssh何时退出, 把它的生命周期绑到本次会话:
-	// 活过会话的relay会留下指向空的远端socket.
-	if stopRelay != nil {
-		defer stopRelay()
-	}
+	// relay无法感知ssh何时退出, 把它的生命周期绑到本次会话, 免得留下指向空的远端socket.
+	// 复用的relay不归本次调用停 (stopRelay为nil), 但会话全程都需要本端口有监听;
+	// 复用的relay可能按自己的idle超时退出, 所以watchdog会重启它并接管它启动的那个.
+	keepAlive := newRelayKeepAlive(selfExe(), *socketFile, *port, stopRelay, errOut)
+	keepAlive.start()
+	defer keepAlive.shutdown()
 
 	cmd := exec.Command("ssh", BuildSSHArgs(sshArgs, *remoteSocket, *port)...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
-	fmt.Fprintf(stderr, "gpg-agent-forward: remote socket %s -> 127.0.0.1:%d\n", *remoteSocket, *port)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, errOut
+	fmt.Fprintf(errOut, "gpg-agent-forward: remote socket %s -> 127.0.0.1:%d\n", *remoteSocket, *port)
 
-	// 把终止信号转发给ssh, 否则信号下deferred stopRelay不执行, relay会残留.
+	// 信号转发给ssh, 否则信号下deferred keepAlive.shutdown不执行, relay会残留.
 	stopSignals := forwardSignals(cmd)
 	defer stopSignals()
 	return cmd.Run()
@@ -210,29 +220,16 @@ func validateSocketFile(path string) error {
 	return nil
 }
 
-// 端口有监听不等于relay在运行: 还要身份锁被持有 (详见relaylock), 否则会把陌生进程当成relay.
-// stop为nil即复用了relay, 不归本次停; 复用只认同一socket文件且idle禁用, 有限idle直接报错.
+// 接受条件: 身份锁被持有且元数据记的正是本次要的socket文件 (详见relayForSocketFile).
+// stop为nil即复用relay, 不归本次停; 同socket文件就复用, 有限idle由watchdog补 (详见relayKeepAlive).
 // idle原样传给relay: ssh传0 (relay无法感知会话结束), ensure用用户的`--idle`.
 func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func(), error) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	if relayRunning(addr) {
-		info, ok := relaylock.ReadInfo(addr)
-		if !ok {
-			// 锁被持有但不可读: relay在, 但它的策略无法判断, 复用它就是猜.
-			return nil, fmt.Errorf(
-				"a relay is listening on %s but its identity lock carries no readable metadata; stop it before starting another",
-				addr)
-		}
-		if info.SocketFile != socketFile {
-			return nil, fmt.Errorf(
-				"a relay is listening on %s for socket file %s, not %s; stop it before starting another",
-				addr, info.SocketFile, socketFile)
-		}
-		if idle == 0 && info.IdleTimeout != 0 {
-			return nil, fmt.Errorf(
-				"a relay is listening on %s with a %s idle timeout, which would let it exit mid-session; stop it and start one with --idle 0",
-				addr, info.IdleTimeout)
-		}
+	reusable, err := relayForSocketFile(addr, socketFile)
+	if err != nil {
+		return nil, err
+	}
+	if reusable {
 		return nil, nil
 	}
 	if socketFile == "" {
@@ -245,6 +242,9 @@ func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func
 		"--idle", idle.String(),
 	}
 	cmd := startDetached(exePath, args)
+	// 限制Wait阻塞在子进程输出管道上的时间, 免得收尾被拖到下面的兜底超时:
+	// relay (或它派生的进程) 若继承并抓着stdout/stderr不放, Wait等的就是它而不是relay.
+	cmd.WaitDelay = 200 * time.Millisecond
 	// 捕获子进程输出, 让启动失败可诊断而不是无迹可寻.
 	// 必须有界: relay可能多活数小时且每连接一行日志, 无上限会一直涨.
 	var childOut boundedBuffer
@@ -270,6 +270,7 @@ func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func
 				return
 			}
 			_ = cmd.Process.Kill()
+			// 通常WaitDelay远早于下面的兜底结束等待; 兜底只覆盖Wait永不返回.
 			select {
 			case <-exited:
 			case <-time.After(2 * time.Second):
@@ -287,22 +288,33 @@ func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func
 	}
 
 	for i := 0; i < 100; i++ {
-		if relayRunning(addr) {
-			return stop, nil
-		}
 		// 子进程一退出就返回, 让relay自己的校验失败立刻带自己的消息上报,
 		// 而不是等满超时再报误导性的未开始监听.
 		select {
 		case <-exited:
 			stop()
+			// 子进程抢端口失败时, 端口可能已被一个正为这个socket文件服务的relay拿走;
+			// 那正是本次调用想要的, 直接复用而不是报错让调用方再重试.
+			if adoptIfAppeared(addr, socketFile) {
+				return nil, nil
+			}
 			return nil, relayStartError(addr, filepath.Base(exePath), childOut.String(), waitErr)
 		default:
+		}
+		// 子进程算作已启动的条件与复用relay相同: 有应答, 锁被持有, 元数据记的正是本次要的socket文件.
+		// 若只认监听加锁, 就会在端口被别的调用抢走时转发到别的agent的socket, 并在结束时杀掉那个relay.
+		// 元数据在子进程写入期间短暂不可读, 所以锁不可读只是推迟接受而不是立刻失败.
+		if reusable, _ := relayForSocketFile(addr, socketFile); reusable {
+			return stop, nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	select {
 	case <-exited:
 		stop()
+		if adoptIfAppeared(addr, socketFile) {
+			return nil, nil
+		}
 		return nil, relayStartError(addr, filepath.Base(exePath), childOut.String(), waitErr)
 	default:
 	}
@@ -315,29 +327,186 @@ func relayRunning(addr string) bool {
 	return Probe(addr) && relaylock.Held(addr)
 }
 
-// 只保留开头的一段: 启动失败会出现在那里, 而relay可能跑数小时且每连接一行日志.
+// 身份锁无人持有时不报错也不复用: 端口要么空闲要么被占, 起自己的relay是调用方的事.
+// 复用条件与子进程启动后的等待故意相同: 有应答不够, 它可能是别的调用为别的agent起的relay.
+func relayForSocketFile(addr, socketFile string) (bool, error) {
+	if !relayRunning(addr) {
+		return false, nil
+	}
+	info, ok := relaylock.ReadInfo(addr)
+	if !ok {
+		// 锁被持有但不可读: relay在, 但没说它转发到哪个agent, 复用它就是猜.
+		return false, fmt.Errorf(
+			"a relay is listening on %s but its identity lock carries no readable metadata; stop it before starting another",
+			addr)
+	}
+	if !sameSocketFile(info.SocketFile, socketFile) {
+		return false, fmt.Errorf(
+			"a relay is listening on %s for socket file %s, not %s; stop it before starting another",
+			addr, info.SocketFile, socketFile)
+	}
+	return true, nil
+}
+
+// 看`socketFile`的relay现在是否已在`addr`上监听, 并短暂等待尚在抢占身份锁的那个.
+// 覆盖的竞态: 本次子进程抢端口失败, 但抢到的可能正是为这个socket文件服务的
+// relay, 那正是调用方想要的; 等待有上限, 通常到这里时它已认领完锁.
+func adoptIfAppeared(addr, socketFile string) bool {
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for {
+		if reusable, _ := relayForSocketFile(addr, socketFile); reusable {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// 故意不解析符号链接: 经链接到达同一文件的两个路径保持不同,
+// 否则会悄悄接受一个转发到别的文件的relay.
+func cleanSocketFile(p string) string {
+	if p == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return filepath.Clean(p)
+}
+
+// 作为变量是为了测试不必等真实间隔.
+var relayWatchInterval = 3 * time.Second
+
+// 会话有两条goroutine同时写诊断 (watchdog与复制ssh stderr的那条),
+// 而`Run`接受任意`io.Writer`, 调用方的writer不保证并发安全.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// ssh会话全程在远端发布着relay的端口, 监听者不能中途消失: 本次启动的relay
+// 已禁用idle, 而复用的那个可能来自带有限idle的`serve`或`ensure`, 到期退出会让
+// 远端socket指向空; 这里盯着端口, 一消失就补一个 (idle禁用).
+type relayKeepAlive struct {
+	exe        string
+	socketFile string
+	port       int
+	warn       io.Writer
+
+	mu sync.Mutex
+	// 本会话启动的relay的stop函数, 会话结束时必须停它; 用别人的relay时为nil.
+	owned func()
+
+	doneOnce sync.Once
+	done     chan struct{}
+	wg       sync.WaitGroup
+}
+
+func newRelayKeepAlive(exePath, socketFile string, port int, owned func(), warn io.Writer) *relayKeepAlive {
+	return &relayKeepAlive{
+		exe:        exePath,
+		socketFile: socketFile,
+		port:       port,
+		warn:       warn,
+		owned:      owned,
+		done:       make(chan struct{}),
+	}
+}
+
+func (k *relayKeepAlive) start() {
+	k.wg.Add(1)
+	go func() {
+		defer k.wg.Done()
+		ticker := time.NewTicker(relayWatchInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-k.done:
+				return
+			case <-ticker.C:
+				k.replaceRelayIfGone()
+			}
+		}
+	}()
+}
+
+// 停掉watchdog, 再停本会话启动的那个relay; 复用的不动 (不归本次停).
+// 幂等, 恰好停一次.
+func (k *relayKeepAlive) shutdown() {
+	k.doneOnce.Do(func() { close(k.done) })
+	k.wg.Wait()
+	k.mu.Lock()
+	stop := k.owned
+	k.owned = nil
+	k.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+func (k *relayKeepAlive) replaceRelayIfGone() {
+	select {
+	case <-k.done:
+		// 会话正在结束, 不要再给它起relay.
+		return
+	default:
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", k.port)
+	if relayRunning(addr) {
+		return
+	}
+	fmt.Fprintf(k.warn, "gpg-agent-forward: relay is no longer listening on %s, starting a replacement with the idle timeout disabled\n", addr)
+	stop, err := EnsureRelay(k.exe, k.socketFile, k.port, 0)
+	if err != nil {
+		// 端口可能只是暂时不可用, 下一次轮询再试.
+		fmt.Fprintf(k.warn, "gpg-agent-forward: could not restart the relay on %s: %v\n", addr, err)
+		return
+	}
+	if stop == nil {
+		// 别的调用的relay在这期间占了端口并被复用, 不归本次停.
+		return
+	}
+	select {
+	case <-k.done:
+		// 替换relay启动期间会话结束了, 这个relay白起了, 就地停掉别留下.
+		stop()
+		return
+	default:
+	}
+	k.mu.Lock()
+	k.owned = stop
+	k.mu.Unlock()
+}
+
+// 只保留最近的字节: relay可能跑数小时后才死, 死因在后几行而不是开头.
 const maxRelayLogBytes = 8 << 10
 
-// 收集writer输出到固定上限后丢弃多余部分, 长命子进程不会撑大本进程.
+// 收集writer输出到固定上限, 超出后丢弃最旧的, 长命子进程不会撑大本进程.
 // 可并发写: exec分两个goroutine复制stdout和stderr.
 type boundedBuffer struct {
 	mu     sync.Mutex
-	buf    bytes.Buffer
+	buf    []byte
 	cutoff bool
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if room := maxRelayLogBytes - b.buf.Len(); room > 0 {
-		if len(p) <= room {
-			b.buf.Write(p)
-		} else {
-			b.buf.Write(p[:room])
-			b.cutoff = true
-		}
-	} else {
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > maxRelayLogBytes {
 		b.cutoff = true
+		// 取尾部时新建切片而非reslice, 一次大写入才不会把整块旧缓冲区一起吊住.
+		kept := make([]byte, maxRelayLogBytes)
+		copy(kept, b.buf[len(b.buf)-maxRelayLogBytes:])
+		b.buf = kept
 	}
 	return len(p), nil
 }
@@ -345,11 +514,10 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 func (b *boundedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := b.buf.String()
-	if b.cutoff {
-		s += "\n[earlier output truncated]"
+	if !b.cutoff {
+		return string(b.buf)
 	}
-	return s
+	return "[earlier output truncated]\n" + string(b.buf)
 }
 
 // 带上wait错误, 让被信号杀死的进程与干净退出的可区分.

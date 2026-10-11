@@ -117,10 +117,16 @@ func TestSplitSSHArgsLeavesSSHFlagsAlone(t *testing.T) {
 			wantThrough: []string{"-N", "dev@host"},
 		},
 		{
-			name:        "idle is not an ssh-subcommand option, so it passes through",
-			in:          []string{"--idle", "5", "dev@host"},
-			wantOwn:     nil,
-			wantThrough: []string{"--idle", "5", "dev@host"},
+			name:        "idle is consumed, never passed to ssh",
+			in:          []string{"--idle", "5m", "dev@host"},
+			wantOwn:     []string{"--idle", "5m"},
+			wantThrough: []string{"dev@host"},
+		},
+		{
+			name:        "idle with an attached value is consumed too",
+			in:          []string{"--idle=5m", "dev@host"},
+			wantOwn:     []string{"--idle=5m"},
+			wantThrough: []string{"dev@host"},
 		},
 		{
 			name:        "single dash form works too",

@@ -99,11 +99,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 	if peerCheckSupported() {
 		policyErr, liveErr := selfPeerCheck()
 		report("peer check", policyErr, "")
-		// live腿只证明检查能在真实连接上跑; 得不出结论 (如TCP表瞬时缺条目) 只是note, 不是
-		// FAIL: 能证明策略坏掉的只有策略检查本身.
-		if liveErr != nil {
-			fmt.Fprintf(stdout, "  note  peer check on a live connection reached no verdict: %v\n", liveErr)
-		}
+		// live腿是真检查不是note: 得不出结论说明本机识别不了peer, 正是relay拒绝所有真实连接
+		// 的状态; 这里报`all checks passed`会让用户以为一切正常, 而每个ssh会话随后都会失败.
+		report("peer check on a live connection", liveErr, "")
 	} else {
 		fmt.Fprintln(stdout, "  n/a   peer check (Windows only)")
 	}
@@ -139,14 +137,13 @@ func trimTrailingNewline(s string) string {
 	return s
 }
 
-// `selfPeerCheck`返回策略检查的错误 (必须让doctor失败) 和live腿的错误 (仅供参考).
-// 策略对合成peer检查, 因为活体探测证明不了它: 本进程自己的连接按设计总是放行,
-// 无论比较是否写反都返回nil.
+// `selfPeerCheck`让doctor报告peer策略是否真的在工作; 返回的策略错误和live腿的错误都
+// 必须让doctor失败. 策略对合成peer检查: 活体探测证明不了它 - 本进程自己的连接按设计
+// 总是放行, 无论比较是否写反都返回nil. live腿不得结论意味着relay会拒绝本机所有真实连接.
 func selfPeerCheck() (policyErr, liveErr error) {
 	if err := peerPolicyCheck(); err != nil {
 		return err, nil
 	}
-	// 再在真实连接上端到端确认机制能跑: 本机查询失败只报note, 不当成策略坏掉的证据.
 	return nil, selfPeerCheckConn()
 }
 
@@ -184,7 +181,7 @@ func selfPeerCheckConn() error {
 }
 
 // `selfPeerCheckResult`: 有结论 (`nil`放行, `ErrPeerNotAllowed`识别后拒绝) 返回nil;
-// 其他错误即没结论 (查询或身份失败), 交doctor报note.
+// 其他错误即没结论 (查询或身份失败), 交doctor失败处理: 没结论所有连接都过不去.
 func selfPeerCheckResult(err error) error {
 	if err == nil || errors.Is(err, winpeer.ErrPeerNotAllowed) {
 		return nil

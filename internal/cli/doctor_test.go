@@ -147,10 +147,37 @@ func TestSelfPeerCheckResultAcceptsVerdicts(t *testing.T) {
 }
 
 func TestSelfPeerCheckResultReportsNoVerdict(t *testing.T) {
-	// 身份识别失败即得不出结论; 错误向上返回, doctor报成note而不是FAIL.
+	// 身份识别失败即得不出结论; 错误向上返回让doctor失败: 识别不了peer的relay会拒绝
+	// 每一个真实连接.
 	lookupErr := errors.New("winpeer: no TCP table entry for 127.0.0.1:1 -> 127.0.0.1:2")
 	if err := selfPeerCheckResult(lookupErr); !errors.Is(err, lookupErr) {
 		t.Errorf("selfPeerCheckResult() = %v, want the lookup error back", err)
+	}
+}
+
+func TestDoctorFailsWhenTheLivePeerCheckReachesNoVerdict(t *testing.T) {
+	// live腿告诉用户本机能否识别ssh客户端; 得不出结论时relay会拒绝所有真实连接,
+	// 这里报`all checks passed`会让用户以为一切正常, 而每个ssh会话随后都会失败.
+	origSupported, origHook := peerCheckSupported, allowPeerHook
+	t.Cleanup(func() { peerCheckSupported, allowPeerHook = origSupported, origHook })
+	peerCheckSupported = func() bool { return true }
+	allowPeerHook = func(net.Conn) error {
+		return errors.New("winpeer: no TCP table entry for the peer")
+	}
+
+	path, _ := fakeAgentFile(t, "OK\n", false)
+
+	var stdout, stderr bytes.Buffer
+	err := runDoctor([]string{"--socket-file", path, "--port", "0"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("runDoctor() = nil, want a failure when the live peer check reaches no verdict")
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "FAIL") || !strings.Contains(out, "live") {
+		t.Errorf("doctor output = %q, want a FAIL naming the live peer check", out)
+	}
+	if strings.Contains(out, "all checks passed") {
+		t.Errorf("doctor reported success while the live peer check reached no verdict: %q", out)
 	}
 }
 
@@ -171,6 +198,11 @@ func TestSelfPeerCheckSeparatesPolicyFromLive(t *testing.T) {
 }
 
 func TestDoctorReportsPeerCheckNAOffWindows(t *testing.T) {
+	if peerCheckSupported() {
+		// 策略存在时doctor直接跑检查而不是报n/a, 所以n/a分支在这里观察不到.
+		t.Skip("the peer check is supported on this platform")
+	}
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "S.gpg-agent.extra")
 	if err := os.WriteFile(path, []byte("nonsense\n"), 0o600); err != nil {

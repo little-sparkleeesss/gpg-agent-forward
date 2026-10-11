@@ -22,4 +22,11 @@ func newLogger(w io.Writer) *log.Logger {
 func peerPolicyCheck() error { return nil }
 
 // 非Windows上无对端策略, doctor必须报n/a而不是声称通过.
-func peerCheckSupported() bool { return false }
+// 声明为变量是为了测试能走doctor对端检查里只有策略存在时才有的分支.
+var peerCheckSupported = func() bool { return false }
+
+// 两种拼写指向同一文件时须视为同一路径, 否则按一种拼写记录的relay无法被另一种拼写复用.
+// POSIX路径区分大小写, 清洗后比较即可; 归一化范围详见`cleanSocketFile`.
+func sameSocketFile(a, b string) bool {
+	return cleanSocketFile(a) == cleanSocketFile(b)
+}

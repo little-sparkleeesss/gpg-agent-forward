@@ -38,13 +38,15 @@ func userSetForwardFailure(userArgs []string) bool {
 	return false
 }
 
-// gpg-agent-forward的ssh子命令认这些选项, 其余选项形状的参数都归ssh.
-// 刻意没有`--idle`: relay的生命期跟ssh会话绑定, 空闲超时是错的, 详见`EnsureRelay`.
+// ssh子命令认这些选项, 其余选项形状的参数都归ssh. `--idle`的值虽被忽略也必须在这里
+// 消费掉: ssh没有这个选项, 透传过去会拒绝启动会话, 详见`runSSH`.
 var sshOwnFlags = map[string]bool{
 	"-socket-file":    true,
 	"--socket-file":   true,
 	"-port":           true,
 	"--port":          true,
+	"-idle":           true,
+	"--idle":          true,
 	"-remote-socket":  true,
 	"--remote-socket": true,
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 
 	"gpg-agent-forward/internal/winpeer"
 )
@@ -29,4 +30,15 @@ func newLogger(w io.Writer) *log.Logger {
 func peerPolicyCheck() error { return winpeer.PolicyCheckSelf() }
 
 // 对端策略只在Windows上生效 (连接经loopback端口到达), doctor的对端检查也只在那里有意义.
-func peerCheckSupported() bool { return true }
+// 声明为变量是为了测试能走只有策略存在时才有的分支.
+var peerCheckSupported = func() bool { return true }
+
+// 两种拼写指向同一文件时须视为同一路径, 否则按一种拼写记录的relay无法被另一种拼写复用.
+// Windows路径可能仅在大小写和分隔符风格上不同, 故两者都折叠; 归一化范围详见`cleanSocketFile`.
+func sameSocketFile(a, b string) bool {
+	return strings.EqualFold(foldSeparators(cleanSocketFile(a)), foldSeparators(cleanSocketFile(b)))
+}
+
+func foldSeparators(p string) string {
+	return strings.ReplaceAll(p, "/", `\`)
+}
