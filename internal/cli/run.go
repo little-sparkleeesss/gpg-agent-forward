@@ -215,17 +215,23 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 
 	cmd := exec.Command("ssh", BuildSSHArgs(sshArgs, *remoteSocket, *port)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, errOut
+	// ssh消失后限制等其输出管道的时间: 否则持有管道的ssh后代 (ProxyCommand,
+	// wrapper, sshd fork的守护进程) 会决定会话何时结束, 收尾和远端清理都得等它.
+	// 值与一次性远端命令相同 (详见sshWaitDelay), 代价也一样: 超出该时间的后代输出会丢.
+	cmd.WaitDelay = sshWaitDelay
 	fmt.Fprintf(errOut, "gpg-agent-forward: remote socket %s -> 127.0.0.1:%d\n", *remoteSocket, *port)
 
-	// 信号转发给ssh, 否则信号下deferred keepAlive.shutdown不执行, relay会残留.
-	stopSignals := forwardSignals(cmd)
-	defer stopSignals()
-	sessionErr := cmd.Run()
+	// 把终止信号转发给ssh, 否则信号下deferred keepAlive.shutdown不执行, relay会残留.
+	// handler先于ssh启动装好, 进程一存在就交给它 (详见signalForwarder).
+	// 装晚了, 窗口里的信号会按默认动作结束本进程并留下relay和ssh; 交早了则会读到Start正在写的东西.
+	signals := forwardSignals()
+	defer signals.stop()
+	sessionErr := runSessionSSH(cmd, signals)
 
 	// 先结束会话再做远端清理, 顺序不能反: 清理自己开ssh连接并可能占用至多`remoteCleanupTimeout`.
 	// 清理期间watchdog若还在, 会为已结束的会话补起没人要的relay, deferred shutdown之后只能再杀掉它.
 	// 信号转发未撤: SIGINT/SIGTERM/SIGHUP被消费而ssh已退出, kill会被吞掉; 两者幂等, deferred的仍兜底.
-	stopSignals()
+	signals.stop()
 	keepAlive.shutdown()
 
 	// sshd负责清理它为转发绑定的socket, 但并不总会清: 死socket留在agent路径
@@ -243,6 +249,25 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 	return sessionErr
+}
+
+// 跑会话的ssh命令, 把进程交给信号转发, 返回会话结果 (正常结束为nil, 否则ssh的错误).
+// 分启动和等待两步而不是`cmd.Run`, 是为了进程一存在就交给转发者: 让它自己读`Process`
+// 字段是在读`Start`正写的东西 (数据竞争), 还可能读早了丢掉窗口里的信号.
+func runSessionSSH(cmd *exec.Cmd, signals signalForwarder) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	signals.attach(cmd.Process)
+
+	err := cmd.Wait()
+	// ssh退0但后代仍占着exec建的stderr管道, WaitDelay到点关掉它: 会话是正常结束的.
+	// 报成失败会给成功的会话打错误并让CLI非零退出, 还让`remoteCleanupNeeded`误判为从未连上而跳过清理.
+	// `ErrWaitDelay`只在状态本为成功时取代它, 不掩盖真实失败: 真失败仍是Wait报的状态.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return nil
+	}
+	return err
 }
 
 // ssh致命错误 (主机不可达, 密钥被拒, 主机密钥变了, 转发没建起来) 都退255 (ssh(1)记载出错则为255).
@@ -629,7 +654,17 @@ func selfExe() string {
 	return p
 }
 
-// 平台没有信号时返回no-op.
-func forwardSignals(cmd *exec.Cmd) func() {
-	return forwardSignalsImpl(cmd)
+// 信号转发器: handler先装好, 进程存在后再交给它, 顺序不能反.
+// 装晚了, 信号按默认动作直接结束本进程, 刚起的relay和ssh被留下, 远端还指着没人应答的socket.
+// 交早了 (会话从前这么做) 是读`Process`与`Start`写它的数据竞争, 还会丢掉窗口里要求结束会话的信号.
+type signalForwarder interface {
+	// 把调用方已启动的会话进程交给转发器: 此前到达的信号会立刻补投, 使ssh启动期间
+	// 落下的信号与晚一点到达的效果相同.必须在stop前调用一次, 传Start成功返回的进程.
+	attach(p *os.Process)
+	// 结束转发, 让信号恢复默认动作, 不在转发目标已消失时被吞掉;
+	// 幂等, 会话收尾可以显式调用, deferred的调用仍可跟在后面.
+	stop()
 }
+
+// 安装终止信号的handler并返回其转发器; 平台没有信号时返回no-op.
+func forwardSignals() signalForwarder { return forwardSignalsImpl() }

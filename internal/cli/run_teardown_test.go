@@ -237,6 +237,95 @@ func TestRunSSHEndsTheSessionBeforeTheRemoteCleanup(t *testing.T) {
 	}
 }
 
+// session路径在ssh退出后允许的耗时上限: 之后全是本进程内毫秒级的活
+// (结束session, 停relay watchdog, 开cleanup连接), 只有等本进程之外的东西
+// 才会把测试推过这个上限 - 那正是用到它的测试要找的.
+const sessionEndBudget = 5 * time.Second
+
+// 在测试goroutine之外跑ssh子命令, 报告它是否在budget内返回: ssh已退出而它的后代
+// 进程仍握着`exec`建的输出管道时, 等管道只受session命令的`WaitDelay`约束,
+// 没有它`Run`会一直等到最后一个持有者退出, 而不是结束session.
+func runSSHWithin(t *testing.T, port int, budget time.Duration) (error, bool) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		err, _ := runSSHAgainstStandIn(t, port)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err, true
+	case <-time.After(budget):
+		return nil, false
+	}
+}
+
+func TestRunSSHSessionEndsWhenADescendantOfSSHHoldsItsStderr(t *testing.T) {
+	// ssh退出时后代进程仍开着ssh的`stderr`管道 (ProxyCommand, wrapper): `errOut`不是`*os.File`,
+	// `exec`经管道复制`stderr`, 要等最后一个持有者关闭才结束; 不设上限session永不结束, 其后的
+	// teardown与远端cleanup不跑. 这里ssh退出0, `exec.Cmd.Wait`自关管道时用`ErrWaitDelay`顶替成功状态,
+	// 详见`WaitDelay`; 该诊断不能当成失败session, 否则`Run`返回error会让CLI报会话错误并非零退出.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSH(t, "sleep 30 & exit 0", "exit 0")
+
+	sessionErr, ended := runSSHWithin(t, port, sessionEndBudget)
+
+	if !ended {
+		t.Fatalf("Run(ssh) was still running %v after ssh exited 0: a descendant holding ssh's stderr kept the session alive",
+			sessionEndBudget)
+	}
+	if sessionErr != nil {
+		t.Errorf("Run(ssh) error = %v, want a session that ended normally: ssh exited 0, and only its stderr pipe was still held",
+			sessionErr)
+	}
+	if want := []string{"probe", "session", "probe"}; !slices.Equal(fake.invocations(t), want) {
+		t.Errorf("ssh invocations = %q, want %q: the remote cleanup must run for a session that ended",
+			fake.invocations(t), want)
+	}
+}
+
+func TestRunSSHSessionKeepsItsOwnStatusWhenADescendantOfSSHHoldsItsStderr(t *testing.T) {
+	// 失败一侧不能动: ssh非零退出或被信号杀死, session就是失败了, 后代仍握`stderr`也不改变.
+	// `ErrWaitDelay`只顶替成功状态, session路径只把它映射回已结束, 不是失败,
+	// 也不是从未连上(cleanup判断把非`*exec.ExitError`的错误读作从未连上).
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script, and Windows has no signals")
+	}
+	cases := []struct {
+		name     string
+		body     string
+		wantCode int
+	}{
+		{"a session that exited non-zero", "sleep 30 & exit 7", 7},
+		{"a session killed by a signal", "sleep 30 & kill -TERM $$", -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			port, _, _ := startAdoptedRelay(t)
+			fake := newStandInSSH(t, tc.body, "exit 0")
+
+			sessionErr, ended := runSSHWithin(t, port, sessionEndBudget)
+
+			if !ended {
+				t.Fatalf("Run(ssh) was still running %v: a descendant holding ssh's stderr kept the session alive",
+					sessionEndBudget)
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(sessionErr, &exitErr) || exitErr.ExitCode() != tc.wantCode {
+				t.Fatalf("Run(ssh) error = %v, want the session's own exit status %d reported",
+					sessionErr, tc.wantCode)
+			}
+			if want := []string{"probe", "session", "probe"}; !slices.Equal(fake.invocations(t), want) {
+				t.Errorf("ssh invocations = %q, want %q: a session that ran must still be cleaned up after",
+					fake.invocations(t), want)
+			}
+		})
+	}
+}
+
 func TestRemoteCleanupNeededSkipsOnlyAFatalConnectionFailure(t *testing.T) {
 	// cleanup连接背后的判断: 只有根本没连上远端主机的session才跳过它.
 	// 信号致死报退出码-1 (详见`os.ProcessState.ExitCode`), 与任何非255的退出状态一样要cleanup.
@@ -281,12 +370,15 @@ func exitErrorFrom(t *testing.T, code int) error {
 }
 
 func TestForwardSignalsStoppingTwiceIsSafe(t *testing.T) {
-	// session一结束`runSSH`就停forwarding, deferred的stop还会再跟一次,
-	// 所以必须能安全地停两次: POSIX实现里第二次close done channel会在
-	// teardown中途panic, 那是最糟的位置.
-	stop := forwardSignals(exec.Command("ssh"))
-	stop()
-	stop()
+	// session一结束`runSSH`就停forwarding, deferred的stop还会再跟一次, 所以必须能停两次:
+	// POSIX实现里第二次close done channel会在teardown中途panic, 那是最糟的位置.
+	// stop是deferred的, 从未到达session的路径也会走到 - 这里第二个forwarder就代表这种.
+	signals := forwardSignals()
+	signals.stop()
+	signals.stop()
+
+	noSession := forwardSignals()
+	noSession.stop()
 }
 
 func TestRunSSHStartsWithTheFlagWhenTheHostCannotTellWhatIsAtThePath(t *testing.T) {
