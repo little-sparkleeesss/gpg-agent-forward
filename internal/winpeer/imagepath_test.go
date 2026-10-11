@@ -3,6 +3,7 @@ package winpeer
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -21,14 +22,18 @@ func TestResolveImagePathLooksUpBareNamesOnPATH(t *testing.T) {
 	// 断言裸名走`PATH`查找而非工作目录: 否则同名诱饵胜出, 对不上对端路径, 自身探针豁免永不生效.
 	const name = "gpg-agent-forward-windows-amd64.exe"
 
-	cwd := t.TempDir()
 	tools := t.TempDir()
-	writeExecutable(t, filepath.Join(cwd, name))
 	onPath := filepath.Join(tools, name)
 	writeExecutable(t, onPath)
-
-	t.Chdir(cwd)
 	t.Setenv("PATH", tools)
+
+	if runtime.GOOS != "windows" {
+		// 工作目录里的同名诱饵不许胜出.
+		// Windows上不种这个诱饵: CreateProcess先搜工作目录, 那里的副本才会被启动, 解析到它是对的.
+		cwd := t.TempDir()
+		writeExecutable(t, filepath.Join(cwd, name))
+		t.Chdir(cwd)
+	}
 
 	if got := resolveImagePath(name); got != onPath {
 		t.Errorf("resolveImagePath(%q) = %q, want the PATH entry %q", name, got, onPath)

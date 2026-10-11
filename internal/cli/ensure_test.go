@@ -111,7 +111,7 @@ func helperStarterRecording(t *testing.T, bindAddr *string, argsOut *[][]string)
 		if bindAddr != nil {
 			*bindAddr = addr
 		}
-		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", addr, socketFileFromServeArgs(t, args))
+		cmd := exec.Command(selfExe(), "-test.run=TestHelperProcess", "--", addr, socketFileFromServeArgs(t, args))
 		cmd.Env = append(os.Environ(), "GPG_AGENT_FORWARD_HELPER=1")
 		return cmd
 	}
@@ -155,7 +155,7 @@ func TestEnsureRelayReportsAChildThatExitsImmediately(t *testing.T) {
 	// 启动即死的relay必须立刻带上自己的错误信息上报, 不能等满超时再报误导性的话; 错误里
 	// 既要带子进程自己说的, 也要带退出状态, 被杀的进程才能与干净退出的区分开.
 	startHook = func(exePath string, args []string) *exec.Cmd {
-		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcessCrash")
+		cmd := exec.Command(selfExe(), "-test.run=TestHelperProcessCrash")
 		cmd.Env = append(os.Environ(), "GPG_AGENT_FORWARD_CRASH_HELPER=1")
 		return cmd
 	}
@@ -291,7 +291,7 @@ func TestStopDoesNotWaitForAGrandchildHoldingThePipe(t *testing.T) {
 	// `Wait`(也就是`stop`)会在每次拆卸时卡到那个持有者退出或兜底超时.
 	startHook = func(exePath string, args []string) *exec.Cmd {
 		addr := "127.0.0.1:" + portFromServeArgs(t, args)
-		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcessWithGrandchild", "--",
+		cmd := exec.Command(selfExe(), "-test.run=TestHelperProcessWithGrandchild", "--",
 			addr, socketFileFromServeArgs(t, args))
 		cmd.Env = append(os.Environ(), "GPG_AGENT_FORWARD_GRANDCHILD_HELPER=1")
 		return cmd
@@ -348,7 +348,7 @@ func TestHelperProcessWithGrandchild(t *testing.T) {
 	}
 	defer release()
 
-	gc := exec.Command(os.Args[0], "-test.run=TestHelperGrandchild")
+	gc := exec.Command(selfExe(), "-test.run=TestHelperGrandchild")
 	gc.Env = append(os.Environ(), "GPG_AGENT_FORWARD_GRANDCHILD=1")
 	gc.Stdout, gc.Stderr = os.Stdout, os.Stderr
 	if err := gc.Start(); err != nil {
@@ -452,7 +452,7 @@ func TestEnsureRelayDoesNotAdoptAnotherInvocationSRelayAtStartup(t *testing.T) {
 		}
 		releaseOther = func() { release(); other.Close() }
 		// ...而本条调用要起的relay因端口已被占而退出.
-		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcessCrash")
+		cmd := exec.Command(selfExe(), "-test.run=TestHelperProcessCrash")
 		cmd.Env = append(os.Environ(), "GPG_AGENT_FORWARD_CRASH_HELPER=1")
 		return cmd
 	}
@@ -682,7 +682,7 @@ func TestEnsureRelayAdoptsARelayThatClaimsThePortLate(t *testing.T) {
 			relayRelease = release
 		}()
 		// 本条调用自己的孩子输掉了端口竞争.
-		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcessPortTaken")
+		cmd := exec.Command(selfExe(), "-test.run=TestHelperProcessPortTaken")
 		cmd.Env = append(os.Environ(), "GPG_AGENT_FORWARD_PORT_TAKEN=1")
 		return cmd
 	}

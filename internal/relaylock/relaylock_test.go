@@ -224,11 +224,12 @@ func TestMetadataFileCarriesTheInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 先记下文件原样: 早先的运行可能留下过数据, 不归这次调用管.
-	// 被测性质是抢锁不写文件, 所以与改动前比, 不与空比.
-	before, _ := os.ReadFile(lockPath)
-	// 下面的反证会往锁文件写负载; 用例收尾删掉, 重复运行才从同一状态起跑.
 	t.Cleanup(func() { os.Remove(lockPath) })
+	// 抢锁前先往锁文件里塞负载: 锁文件里是什么, `ReadInfo`都必须只答info文件的内容.
+	// 写必须在前: Windows上持锁的字节范围锁会让别的句柄够不到被锁区域.
+	if err := os.WriteFile(lockPath, encodeInfo(Info{SocketFile: "from-the-lock-file"}), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	release, ok := TryLock(addr, want)
 	if !ok {
@@ -236,15 +237,6 @@ func TestMetadataFileCarriesTheInfo(t *testing.T) {
 	}
 	defer release()
 
-	// 锁文件只是锁, 什么都不写进去, 内容再变也伤不到读者.
-	// Windows锁住首字节: 持锁时别的句柄读该字节必失败.
-	data, err := os.ReadFile(lockPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != string(before) {
-		t.Errorf("lock file changed from %q to %q; taking the lock must not write to it", before, data)
-	}
 	infoPath := infoFile(lockPath)
 	if infoPath == lockPath {
 		t.Fatal("info file and lock file are the same path")
@@ -260,16 +252,43 @@ func TestMetadataFileCarriesTheInfo(t *testing.T) {
 	if decoded != want {
 		t.Errorf("info file holds %+v, want %+v", decoded, want)
 	}
-	// 反证"元数据绝不从锁文件读": 往锁文件塞负载, `ReadInfo`仍须只答info文件的内容.
-	if err := os.WriteFile(lockPath, encodeInfo(Info{SocketFile: "from-the-lock-file"}), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// 反证"元数据绝不从锁文件读": 抢锁前塞进锁文件的负载必须被`ReadInfo`无视.
 	got, ok := ReadInfo(addr)
 	if !ok {
 		t.Fatal("ReadInfo() ok = false, want the metadata of the held lock")
 	}
 	if got != want {
 		t.Errorf("ReadInfo() = %+v, want the info file's %+v (the lock file must not be read)", got, want)
+	}
+}
+
+func TestTakingTheLockWritesNothingToTheLockFile(t *testing.T) {
+	// 锁文件不带数据, 里面是什么都误导不了读者; 检查点选在释放之后而非持锁期间:
+	// Windows的强制字节范围锁使持锁时别的句柄读不到它, 这正是元数据要另放一个文件的原因.
+	defer saveEnv("XDG_RUNTIME_DIR")()
+	privateDir(t)
+	const addr = "127.0.0.1:59320"
+	lockPath, err := lockFile(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(lockPath) })
+
+	// 早先的运行可能留下过东西, 不归这次调用管: 与改动前的状态比, 不与空比.
+	before, _ := os.ReadFile(lockPath)
+
+	release, ok := TryLock(addr, Info{SocketFile: "/tmp/sock"})
+	if !ok {
+		t.Fatal("TryLock() ok = false, want to take a free lock")
+	}
+	release()
+
+	after, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("lock file changed from %q to %q; taking the lock must not write to it", before, after)
 	}
 }
 
