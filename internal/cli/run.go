@@ -151,6 +151,8 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	port := fs.Int("port", DefaultRelayPort, "loopback port for ssh to dial")
 	remoteSocket := fs.String("remote-socket", "",
 		"socket path to create on the remote host (default: ask the remote for `gpgconf --list-dirs agent-socket`)")
+	skipRemoteCheck := fs.Bool("skip-remote-check", false,
+		"start the session even when the remote host could not be checked for a live socket at that path")
 	// idle选项被接受但忽略: ssh会话用的relay总是禁用idle, 因为relay无法感知
 	// 会话结束; 这里必须消费掉它, 否则会透传给ssh而被它拒绝, 会话根本起不来.
 	fs.Duration("idle", 0,
@@ -178,10 +180,22 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	// 拒绝覆盖远端主机自己的agent socket: 否则首次连接会顺带启动那个agent,
-	// 再替换其活动socket, gpg会静默用远端密钥签名.
-	if err := CheckRemoteSocketFree(sshArgs, *remoteSocket, runSSHCommand); err != nil {
+	// 拒绝覆盖远端主机自己的agent socket: 否则首次连接会顺带启动那个agent, gpg会静默用远端密钥签名.
+	// 同一检查会清掉上次会话留下的死socket, 这是对远端的改动, 所以会报告.
+	// 探针跑不起来或判不了路径的一律拒绝; `--skip-remote-check`是明知风险的放行口, 但放不过已有结论的.
+	remoteState, err := CheckRemoteSocketFree(sshArgs, *remoteSocket, runSSHCommand)
+	unchecked := err != nil && *skipRemoteCheck &&
+		(remoteState == socketUnreported || remoteState == socketUnjudgeable)
+	if err != nil && !unchecked {
 		return err
+	}
+	switch remoteState {
+	case socketReclaimed:
+		fmt.Fprintf(stderr, "gpg-agent-forward: removed a leftover socket nothing was listening on at %s on the remote host\n", *remoteSocket)
+	case socketUnreported, socketUnjudgeable:
+		if unchecked {
+			fmt.Fprintf(stderr, "gpg-agent-forward: --skip-remote-check: starting without checking what is at %s on the remote host\n", *remoteSocket)
+		}
 	}
 
 	// 从这里起的诊断 (下面这行, ssh的stderr, watchdog) 都走同一把锁,
@@ -206,7 +220,51 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	// 信号转发给ssh, 否则信号下deferred keepAlive.shutdown不执行, relay会残留.
 	stopSignals := forwardSignals(cmd)
 	defer stopSignals()
-	return cmd.Run()
+	sessionErr := cmd.Run()
+
+	// 先结束会话再做远端清理, 顺序不能反: 清理自己开ssh连接并可能占用至多`remoteCleanupTimeout`.
+	// 清理期间watchdog若还在, 会为已结束的会话补起没人要的relay, deferred shutdown之后只能再杀掉它.
+	// 信号转发未撤: SIGINT/SIGTERM/SIGHUP被消费而ssh已退出, kill会被吞掉; 两者幂等, deferred的仍兜底.
+	stopSignals()
+	keepAlive.shutdown()
+
+	// sshd负责清理它为转发绑定的socket, 但并不总会清: 死socket留在agent路径
+	// 上会挡住下一次调用.尽力而为且有上限, 用户正准备离开.
+	// 从未连上的会话跳过清理, 失败也只在会话成功时报告 (详见remoteCleanupNeeded).
+	if remoteCleanupNeeded(sessionErr) {
+		cleanup := func(sshArgs []string, remoteCommand string) (string, error) {
+			return runSSHCommandWithin(remoteCleanupTimeout, sshArgs, remoteCommand)
+		}
+		err := RemoveRemoteSocketAfterSession(sshArgs, *remoteSocket, cleanup)
+		if err != nil && sessionErr == nil {
+			// 只在会话成功时警告: 会话失败时那条错误才是消息, 且由调用方在本函数返回后
+			// 打印, 这里的警告会把真正的错误顶出视野; 留下的socket由下次调用的预检回收并报告.
+			fmt.Fprintf(errOut, "gpg-agent-forward: could not clean up %s on the remote host: %v\n", *remoteSocket, err)
+		}
+	}
+	return sessionErr
+}
+
+// ssh致命错误 (主机不可达, 密钥被拒, 主机密钥变了, 转发没建起来) 都退255 (ssh(1)记载出错则为255).
+// 本命令加了`ExitOnForwardFailure=yes`, 绑不上远端socket的会话也退255; 这类会话没有socket需要清理.
+// 远端命令也可能退255, 那只会少一次清理提示, 下次调用的预检会回收并报告.
+const sshConnectFailureExitCode = 255
+
+// 只有没跑成的会话为false: 进程没起来, 或ssh自己的错误退出码 (详见sshConnectFailureExitCode).
+// 这两种没有socket可清, 再连一次只会让刚失败的主机再超时一遍, 要口令或二次验证的还会再问一次.
+// 其余都清理, 信号也算: Ctrl-C或kill掉的会话正是会留下转发socket的那种.
+func remoteCleanupNeeded(sessionErr error) bool {
+	if sessionErr == nil {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(sessionErr, &exitErr) {
+		// 不是进程退出: ssh根本没起来 (找不到或不可执行), 没有会话也就没有socket.
+		return false
+	}
+	// 被信号终结时`ExitCode`为-1 (`os.ProcessState.ExitCode`), 这正是要清理的情形,
+	// 所以只有ssh自用的那个退出码才跳过清理.
+	return exitErr.ExitCode() != sshConnectFailureExitCode
 }
 
 func validateSocketFile(path string) error {

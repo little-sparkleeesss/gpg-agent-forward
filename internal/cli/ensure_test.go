@@ -580,9 +580,10 @@ func TestRelayKeepAliveDoesNotRestartAfterTheSessionEnds(t *testing.T) {
 func fakeSSH(t *testing.T, sessionStarted string) {
 	t.Helper()
 	dir := t.TempDir()
+	// 探针靠回显的判定标记被认出(那是它命令行里唯一稳定的部分), 回答是路径空闲.
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
-		"  *\"test -e\"*) echo gpg-agent-forward-socket-absent ;;\n" +
+		"  *" + socketAbsentMarker + "*) echo " + socketAbsentMarker + " ;;\n" +
 		"  *) : > " + shellQuoteSingle(sessionStarted) + " ; sleep 4 ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {

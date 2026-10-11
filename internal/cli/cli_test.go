@@ -218,6 +218,12 @@ func TestValidateRemoteSocket(t *testing.T) {
 		"/run/user/1000/gnupg/S.gpg-agent",
 		"/home/me/.gnupg-forwarded/S.gpg-agent",
 		"relative/path/S.gpg-agent",
+		// 空格和单引号在Unix路径里合法, 探针会为远端shell引用路径, 拒绝它们会错杀能用的路径.
+		"/run/user/1000/gnupg dir/S.gpg-agent",
+		"/run/user/1000/it's/S.gpg-agent",
+		// 非ASCII名字是普通Unix路径 (用转义写以保持本文件ASCII); 校验的是会不会破坏远端
+		// 命令, 而不是locale允许什么.
+		"/run/user/1000/gnupg-\xe4\xbb\xa3\xe7\x90\x86/S.gpg-agent",
 	}
 	for _, p := range ok {
 		if err := ValidateRemoteSocket(p); err != nil {
@@ -232,9 +238,35 @@ func TestValidateRemoteSocket(t *testing.T) {
 	if err := ValidateRemoteSocket(""); err == nil {
 		t.Error("ValidateRemoteSocket() error = nil, want rejection of an empty path")
 	}
-	// `sockaddr_un`的`sun_path`上限108字节, 含结尾符.
-	long := "/" + string(make([]byte, 108))
-	if err := ValidateRemoteSocket(long); err == nil {
+
+	// 控制字符. 换行最要命: 探针是交给远端登录shell的单行命令, `csh`/`tcsh`拒绝跨行的
+	// 引号词, 于是探针什么都不跑, 所有检查都读成`could not be checked`.
+	// 其余字符在路径里也没用, 还会让路径对不上远端列出的地址.
+	rejected := []struct {
+		name string
+		path string
+	}{
+		{"newline", "/run/user/1000/gnupg\n/S.gpg-agent"},
+		{"carriage return", "/run/user/1000/gnupg\r/S.gpg-agent"},
+		{"tab", "/run/user/1000/gnupg\t/S.gpg-agent"},
+		{"DEL", "/run/user/1000/gnupg\x7f/S.gpg-agent"},
+	}
+	for _, tc := range rejected {
+		if err := ValidateRemoteSocket(tc.path); err == nil {
+			t.Errorf("ValidateRemoteSocket(%q) error = nil, want rejection of a %s", tc.path, tc.name)
+		}
+	}
+	// 报错必须说出原因, 不只说字符非法: 原因才让用户明白这路径无论怎么引用都不行.
+	if err := ValidateRemoteSocket("/tmp/a\nb"); err == nil || !strings.Contains(err.Error(), "single-line") {
+		t.Errorf("ValidateRemoteSocket() error = %v, want it to explain the single-line remote command", err)
+	}
+
+	// `sockaddr_un`的`sun_path`含结尾符上限108字节: 路径107字节放得下, 108不行.
+	fits := "/" + strings.Repeat("a", 106)
+	if err := ValidateRemoteSocket(fits); err != nil {
+		t.Errorf("ValidateRemoteSocket(%d-byte path) error = %v, want nil", len(fits), err)
+	}
+	if err := ValidateRemoteSocket(fits + "a"); err == nil {
 		t.Error("ValidateRemoteSocket() error = nil, want rejection of an over-long path")
 	}
 }

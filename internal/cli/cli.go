@@ -51,6 +51,12 @@ var sshOwnFlags = map[string]bool{
 	"--remote-socket": true,
 }
 
+// 开关选项单列: `sshOwnFlags`会把后一个参数当值消费, 混进去会吞掉目标主机.
+var sshOwnBoolFlags = map[string]bool{
+	"-skip-remote-check":  true,
+	"--skip-remote-check": true,
+}
+
 // ssh自带`-N`, `-p`, `-i`, `-o`, 交给通用flag解析器会被拒; 这里只消费自己认识的选项,
 // 其余原样透传并保持顺序; `--`结束gpg-agent-forward的解析.
 func SplitSSHArgs(args []string) (own, through []string) {
@@ -71,6 +77,10 @@ func SplitSSHArgs(args []string) (own, through []string) {
 				i++
 				own = append(own, args[i])
 			}
+			continue
+		}
+		if sshOwnBoolFlags[name] {
+			own = append(own, a)
 			continue
 		}
 		through = append(through, a)
@@ -103,8 +113,11 @@ func ValidatePort(port int) error {
 	return nil
 }
 
-// 拒绝ssh会读错的远端socket路径: 冒号会被解析成地址分隔符; 超长则越过两端都强制的
-// `sockaddr_un`上限(含终止符108字节, 可用107).
+// 拒绝ssh会读错的远端socket路径, 也拒绝过不了远端登录shell的路径: 冒号会被解析成
+// 地址分隔符, 超长则越过两端都强制的`sockaddr_un`上限(含终止符108字节, 可用107).
+// 控制字符同理: 换行会让交给远端登录shell的单行探针散成多行, `csh`/`tcsh`拒绝跨行的
+// 引号词而什么都不跑, 调用方只能读成问不到主机; 其余C0控制符与DEL还会破坏路径与远端
+// 回报地址的匹配, 详见`remoteSocketProbe`; 空格和单引号合法, 本检查先于构造探针.
 func ValidateRemoteSocket(p string) error {
 	if p == "" {
 		return fmt.Errorf("remote socket path is empty")
@@ -112,6 +125,9 @@ func ValidateRemoteSocket(p string) error {
 	for _, r := range p {
 		if r == ':' {
 			return fmt.Errorf("remote socket path %q must not contain ':'", p)
+		}
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("remote socket path %q must not contain the control character %q (U+%04X): the remote probe is a single-line command, so a path like this makes it run as several lines (csh and tcsh reject that) and stops it matching the addresses the remote host reports", p, r, r)
 		}
 	}
 	if len(p) >= 108 {

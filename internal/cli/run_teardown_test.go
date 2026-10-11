@@ -1,0 +1,351 @@
+package cli
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"gpg-agent-forward/internal/relaylock"
+)
+
+// `PATH`上的替身ssh, 每次调用记一行日志, 测试据此看wrapper在session之后
+// 有没有再开第二条连接, 以及为了什么.
+// session分支跑过之前的探针是pre-check, 之后的探针就是cleanup连接, 跑测试给的片段.
+type standInSSH struct {
+	log     string
+	started string // 由session分支创建
+	cleanup string // 由cleanup连接创建, 在其片段运行之前
+}
+
+func newStandInSSH(t *testing.T, sessionBody, cleanupBody string) *standInSSH {
+	t.Helper()
+	return newStandInSSHSaying(t, socketAbsentMarker, sessionBody, cleanupBody)
+}
+
+// 同`newStandInSSH`, 但探针的应答由测试选定: 回free才能开session;
+// 空应答表示探针什么都报不回来, 即主机上跑不了它 - pre-check与cleanup连接都一样.
+func newStandInSSHSaying(t *testing.T, verdict, sessionBody, cleanupBody string) *standInSSH {
+	t.Helper()
+	dir := t.TempDir()
+	f := &standInSSH{
+		log:     filepath.Join(dir, "invocations"),
+		started: filepath.Join(dir, "session-started"),
+		cleanup: filepath.Join(dir, "cleanup-started"),
+	}
+	// 用`:`而非空行: shell拒绝空的then/else分支, 什么都不答的探针也必须是条命令.
+	answer := ":"
+	if verdict != "" {
+		answer = "echo " + verdict
+	}
+	// session调用带`-R`与目标主机; 探针调用把marker放在远端脚本里.
+	// session分支跑之前的探针是pre-check, 之后是cleanup连接, 跑测试给的片段.
+	script := fmt.Sprintf(`#!/bin/sh
+case "$*" in
+  *%s*)
+    echo probe >> %s
+    if [ -e %s ]; then
+      : > %s
+      %s
+    else
+      %s
+    fi
+    ;;
+  *)
+    echo session >> %s
+    : > %s
+    %s
+    ;;
+esac
+`,
+		socketAbsentMarker, shellQuoteSingle(f.log),
+		shellQuoteSingle(f.started), shellQuoteSingle(f.cleanup), cleanupBody,
+		answer,
+		shellQuoteSingle(f.log), shellQuoteSingle(f.started), sessionBody)
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write the stand-in ssh: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return f
+}
+
+// 各次调用留下的日志行; 只在session goroutine结束后读, 文件已不再被写.
+func (f *standInSSH) invocations(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile(f.log)
+	if err != nil {
+		t.Fatalf("read the stand-in ssh log: %v", err)
+	}
+	return strings.Fields(string(data))
+}
+
+func (f *standInSSH) waitForCleanupConnection(t *testing.T) {
+	t.Helper()
+	waitUntil(t, func() bool { _, err := os.Stat(f.cleanup); return err == nil },
+		"no cleanup connection was opened after the session")
+}
+
+// 在空闲端口放一个让session收养的relay, 免得wrapper自己起relay子进程.
+func startAdoptedRelay(t *testing.T) (port int, addr string, stop func()) {
+	t.Helper()
+	port, stop = startFakeRelayStoppable(t, relaylock.Info{SocketFile: "/tmp/sock"})
+	return port, fmt.Sprintf("127.0.0.1:%d", port), stop
+}
+
+// `extra`里的gpg-agent-forward选项放在目标主机之前; 返回`Run`的error和写到诊断输出的内容.
+func runSSHAgainstStandIn(t *testing.T, port int, extra ...string) (error, string) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	args := []string{
+		"ssh",
+		"--port", fmt.Sprint(port),
+		"--socket-file", "/tmp/sock",
+		"--remote-socket", "/run/user/1000/gnupg/S.gpg-agent",
+	}
+	args = append(args, extra...)
+	args = append(args, "dev@host")
+	err := Run(args, &out, &errOut)
+	return err, errOut.String()
+}
+
+func TestRunSSHSkipsTheRemoteCleanupWhenTheSessionNeverConnected(t *testing.T) {
+	// ssh在session尚未建立就失败时退出255: 主机不可达, key被拒, host key变了.
+	// 此时远端什么都没绑定, 再连一次只会让用户对着刚失败的主机再等一轮.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSH(t, "exit 255", "exit 0")
+
+	err, _ := runSSHAgainstStandIn(t, port)
+
+	// 替身ssh退出255, 这正是本用例的前提; 换别的状态, 下面的断言就没有意义.
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != sshConnectFailureExitCode {
+		t.Fatalf("Run(ssh) error = %v, want the stand-in ssh's own %d", err, sshConnectFailureExitCode)
+	}
+	want := []string{"probe", "session"}
+	if got := fake.invocations(t); !slices.Equal(got, want) {
+		t.Errorf("ssh invocations = %q, want %q, with no cleanup connection", got, want)
+	}
+}
+
+func TestRunSSHCleansUpAfterASessionThatRan(t *testing.T) {
+	// session跑过就可能留下forward socket, 所以cleanup连接必须做.
+	// session本身成功时, cleanup失败是这次run里用户唯一会听到的事, 必须报出来.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSH(t, "exit 0", `echo "cleanup refused" >&2; exit 1`)
+
+	err, errOut := runSSHAgainstStandIn(t, port)
+
+	if err != nil {
+		t.Fatalf("Run(ssh) error = %v, want the session to end cleanly", err)
+	}
+	want := []string{"probe", "session", "probe"}
+	if got := fake.invocations(t); !slices.Equal(got, want) {
+		t.Errorf("ssh invocations = %q, want %q, with one cleanup connection", got, want)
+	}
+	if !strings.Contains(errOut, "could not clean up") {
+		t.Errorf("diagnostics = %q, want the cleanup failure reported after a session that succeeded", errOut)
+	}
+}
+
+func TestRunSSHCleansUpAfterASessionKilledByASignal(t *testing.T) {
+	// Ctrl-C或kill掉的session最容易留下forward socket, 所以cleanup仍要跑:
+	// 被信号杀死的退出码是-1, 不能当成ssh自己的255.
+	// 用户最需要的是session自己的错误, cleanup失败不能打印在它前面.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script, and Windows has no signals")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSH(t, "kill -TERM $$", `echo "cleanup refused" >&2; exit 1`)
+
+	err, errOut := runSSHAgainstStandIn(t, port)
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != -1 {
+		t.Fatalf("Run(ssh) error = %v, want the session to have died from the signal rather than exited", err)
+	}
+	want := []string{"probe", "session", "probe"}
+	if got := fake.invocations(t); !slices.Equal(got, want) {
+		t.Errorf("ssh invocations = %q, want %q, with one cleanup connection", got, want)
+	}
+	if strings.Contains(errOut, "could not clean up") {
+		t.Errorf("diagnostics = %q, want no cleanup warning ahead of the session's own error", errOut)
+	}
+}
+
+func TestRunSSHEndsTheSessionBeforeTheRemoteCleanup(t *testing.T) {
+	// cleanup连接最长可挂到`remoteCleanupTimeout`, 在那之前session的一切都必须停掉:
+	// 还在走的watchdog会看到端口空(relay已随session停), 给已结束的session补一个
+	// relay, 而只有deferred shutdown有权杀它. 本测试在此窗口内把relay拿走.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	shortenRelayWatch(t)
+
+	var started [][]string
+	helperStarterRecording(t, nil, &started)
+
+	port, addr, stopAdopted := startAdoptedRelay(t)
+	fake := newStandInSSH(t, "exit 0", "sleep 1; exit 0")
+
+	var out, errOut bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- Run([]string{
+			"ssh",
+			"--port", fmt.Sprint(port),
+			"--socket-file", "/tmp/sock",
+			"--remote-socket", "/run/user/1000/gnupg/S.gpg-agent",
+			"dev@host",
+		}, &out, &errOut)
+	}()
+
+	// 此时cleanup连接正在sleep: session已结束, 其teardown已跑完或正在跑.
+	fake.waitForCleanupConnection(t)
+	stopAdopted()
+	waitUntil(t, func() bool { return !relayRunning(addr) },
+		"the relay the session adopted did not stop")
+
+	// 很多个watchdog间隔: 还在跑的话有充分机会把relay再放上端口.
+	time.Sleep(10 * relayWatchInterval)
+	if relayRunning(addr) {
+		t.Error("a replacement relay appeared on the port after the session had ended")
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("Run(ssh) error = %v, want the session to end cleanly; diagnostics: %q", err, errOut.String())
+	}
+	// session goroutine已结束, 这里读它不再有竞争.
+	if len(started) != 0 {
+		t.Errorf("the watchdog started %d relay(s) after the session ended: %q", len(started), started)
+	}
+	if relayRunning(addr) {
+		t.Error("a relay is still listening on the port after the session ended")
+	}
+}
+
+func TestRemoteCleanupNeededSkipsOnlyAFatalConnectionFailure(t *testing.T) {
+	// cleanup连接背后的判断: 只有根本没连上远端主机的session才跳过它.
+	// 信号致死报退出码-1 (详见`os.ProcessState.ExitCode`), 与任何非255的退出状态一样要cleanup.
+	missing := exec.Command("gpg-agent-forward-no-such-ssh-binary").Run()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"a session that succeeded", nil, true},
+		{"a session that exited non-zero", exitErrorFrom(t, 1), true},
+		{"a session that exited 255", exitErrorFrom(t, 255), false},
+		{"a session whose ssh could not be started", missing, false},
+	}
+	for _, tc := range cases {
+		if got := remoteCleanupNeeded(tc.err); got != tc.want {
+			t.Errorf("remoteCleanupNeeded(%v) = %v, want %v (%s)", tc.err, got, tc.want, tc.name)
+		}
+	}
+}
+
+// 不是真测试: 按`GPG_AGENT_FORWARD_EXIT_HELPER`指定的状态退出,
+// 好让调用方造出真正带ssh退出码的`*exec.ExitError`.
+func TestHelperProcessExit(t *testing.T) {
+	code := os.Getenv("GPG_AGENT_FORWARD_EXIT_HELPER")
+	if code == "" {
+		return
+	}
+	n, err := strconv.Atoi(code)
+	if err != nil {
+		os.Exit(2)
+	}
+	os.Exit(n)
+}
+
+func exitErrorFrom(t *testing.T, code int) error {
+	t.Helper()
+	cmd := exec.Command(selfExe(), "-test.run=TestHelperProcessExit")
+	cmd.Env = append(os.Environ(), "GPG_AGENT_FORWARD_EXIT_HELPER="+strconv.Itoa(code))
+	return cmd.Run()
+}
+
+func TestForwardSignalsStoppingTwiceIsSafe(t *testing.T) {
+	// session一结束`runSSH`就停forwarding, deferred的stop还会再跟一次,
+	// 所以必须能安全地停两次: POSIX实现里第二次close done channel会在
+	// teardown中途panic, 那是最糟的位置.
+	stop := forwardSignals(exec.Command("ssh"))
+	stop()
+	stop()
+}
+
+func TestRunSSHStartsWithTheFlagWhenTheHostCannotTellWhatIsAtThePath(t *testing.T) {
+	// 探针答unknown (没有`ss`, `ss`失败, 内核socket表读不到)不是关于路径的结论;
+	// `--skip-remote-check`的help承诺远端查不了时就开session, 这类回答同样要能被它放行.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+
+	t.Run("without the flag the session does not open", func(t *testing.T) {
+		port, _, _ := startAdoptedRelay(t)
+		fake := newStandInSSHSaying(t, socketUnknownMarker, "exit 0", "exit 0")
+
+		err, _ := runSSHAgainstStandIn(t, port)
+
+		if err == nil {
+			t.Fatal("Run(ssh) error = nil, want a refusal when the host could not tell")
+		}
+		if !strings.Contains(err.Error(), "--skip-remote-check") {
+			t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
+		}
+		if want := []string{"probe"}; !slices.Equal(fake.invocations(t), want) {
+			t.Errorf("ssh invocations = %q, want %q: the session must not open", fake.invocations(t), want)
+		}
+	})
+
+	t.Run("with the flag the session runs", func(t *testing.T) {
+		port, _, _ := startAdoptedRelay(t)
+		fake := newStandInSSHSaying(t, socketUnknownMarker, "exit 0", "exit 0")
+
+		err, errOut := runSSHAgainstStandIn(t, port, "--skip-remote-check")
+
+		if err != nil {
+			t.Fatalf("Run(ssh) error = %v, want the session to run with the flag given; diagnostics: %q", err, errOut)
+		}
+		if want := []string{"probe", "session", "probe"}; !slices.Equal(fake.invocations(t), want) {
+			t.Errorf("ssh invocations = %q, want %q", fake.invocations(t), want)
+		}
+		if !strings.Contains(errOut, "--skip-remote-check") {
+			t.Errorf("diagnostics = %q, want the skipped check reported", errOut)
+		}
+	})
+}
+
+func TestRunSSHRefusesALiveSocketWhateverTheFlagSays(t *testing.T) {
+	// 活socket是远端自己的agent, 盖上去正是检查要防的故障;
+	// 这个flag只覆盖没能查, 放宽到未决状态也不能放到这一种.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSHSaying(t, socketLiveMarker, "exit 0", "exit 0")
+
+	err, _ := runSSHAgainstStandIn(t, port, "--skip-remote-check")
+
+	if err == nil {
+		t.Fatal("Run(ssh) error = nil, want a refusal for a live socket even with --skip-remote-check")
+	}
+	if want := []string{"probe"}; !slices.Equal(fake.invocations(t), want) {
+		t.Errorf("ssh invocations = %q, want %q: the session must not open", fake.invocations(t), want)
+	}
+}
