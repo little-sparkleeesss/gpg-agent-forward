@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gpg-agent-forward/internal/relaylock"
 )
 
 func TestProbeDetectsListener(t *testing.T) {
@@ -37,7 +39,7 @@ func TestProbeReturnsFalseWhenNothingListening(t *testing.T) {
 
 func TestEnsureRelayDoesNotStartWhenAlreadyRunning(t *testing.T) {
 	// 认出正在运行的relay靠它的身份锁, 不只是端口被占.
-	port := startFakeRelay(t)
+	port := startFakeRelay(t, relaylock.Info{SocketFile: "/tmp/sock"})
 
 	// 故意写坏的`exePath`证明`EnsureRelay`没尝试拉起任何进程: 试了就会失败报错.
 	stop, err := EnsureRelay(`C:\does\not\exist.exe`, "/tmp/sock", port, time.Minute)
@@ -46,6 +48,33 @@ func TestEnsureRelayDoesNotStartWhenAlreadyRunning(t *testing.T) {
 	}
 	if stop != nil {
 		t.Error("EnsureRelay() stop != nil, want nil when a relay was already listening")
+	}
+}
+
+func TestBoundedBufferStopsGrowingAtTheLimit(t *testing.T) {
+	var b boundedBuffer
+	chunk := bytes.Repeat([]byte("x"), 4096)
+	for i := 0; i < 100; i++ {
+		if _, err := b.Write(chunk); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	got := b.String()
+	if len(got) > maxRelayLogBytes+len("\n[earlier output truncated]") {
+		t.Errorf("boundedBuffer grew to %d bytes, want at most the limit plus the notice", len(got))
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Error("boundedBuffer did not note that output was truncated")
+	}
+}
+
+func TestBoundedBufferKeepsShortOutputIntact(t *testing.T) {
+	var b boundedBuffer
+	if _, err := b.Write([]byte("socket file is unusable\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if got := b.String(); got != "socket file is unusable\n" {
+		t.Errorf("boundedBuffer.String() = %q, want the output unchanged", got)
 	}
 }
 

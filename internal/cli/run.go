@@ -62,8 +62,9 @@ Common options:
                        (default %LOCALAPPDATA%\gnupg\S.gpg-agent.extra)
   --port N             loopback port used between the relay and ssh
                        (default 29173)
-  --idle DURATION      serve only: exit after this long with no connection
-                       (default 15m; 0 disables)
+  --idle DURATION      exit after this long with no connection
+                       (default 15m; 0 disables; ignored by ssh, which ties
+                       the relay's lifetime to the session)
   --remote-socket PATH ssh only: socket path to create on the remote host
                        (default: whatever gpgconf --list-dirs agent-socket reports)
 
@@ -210,13 +211,28 @@ func validateSocketFile(path string) error {
 }
 
 // 端口有监听不等于relay在运行: 还要身份锁被持有 (详见relaylock), 否则会把陌生进程当成relay.
-// stop为nil即复用了已有relay, 不归本次停.
-// idle原样传给relay: ssh传0 (relay无法感知ssh会话何时结束), ensure用用户的`--idle`.
+// stop为nil即复用了relay, 不归本次停; 复用只认同一socket文件且idle禁用, 有限idle直接报错.
+// idle原样传给relay: ssh传0 (relay无法感知会话结束), ensure用用户的`--idle`.
 func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func(), error) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	// 身份锁能否使用是机器的属性而非每次轮询的属性, 所以只探测一次.
-	canLock := relaylock.CanLock()
-	if relayRunning(addr, canLock) {
+	if relayRunning(addr) {
+		info, ok := relaylock.ReadInfo(addr)
+		if !ok {
+			// 锁被持有但不可读: relay在, 但它的策略无法判断, 复用它就是猜.
+			return nil, fmt.Errorf(
+				"a relay is listening on %s but its identity lock carries no readable metadata; stop it before starting another",
+				addr)
+		}
+		if info.SocketFile != socketFile {
+			return nil, fmt.Errorf(
+				"a relay is listening on %s for socket file %s, not %s; stop it before starting another",
+				addr, info.SocketFile, socketFile)
+		}
+		if idle == 0 && info.IdleTimeout != 0 {
+			return nil, fmt.Errorf(
+				"a relay is listening on %s with a %s idle timeout, which would let it exit mid-session; stop it and start one with --idle 0",
+				addr, info.IdleTimeout)
+		}
 		return nil, nil
 	}
 	if socketFile == "" {
@@ -229,8 +245,9 @@ func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func
 		"--idle", idle.String(),
 	}
 	cmd := startDetached(exePath, args)
-	// 捕获子进程输出, 让relay没能开始监听成为可诊断的错误而不是死路.
-	var childOut bytes.Buffer
+	// 捕获子进程输出, 让启动失败可诊断而不是无迹可寻.
+	// 必须有界: relay可能多活数小时且每连接一行日志, 无上限会一直涨.
+	var childOut boundedBuffer
 	cmd.Stdout = &childOut
 	cmd.Stderr = &childOut
 	if err := cmd.Start(); err != nil {
@@ -257,19 +274,20 @@ func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func
 			case <-exited:
 			case <-time.After(2 * time.Second):
 			}
-		})
-		// 给OS一点时间释放端口, 让立刻重连能重新绑定.
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if !Probe(addr) {
-				return
+			// 给OS一点时间释放端口, 让立刻重连能重新绑定; 上限远低于上面的Wait超时:
+			// 端口若还被残留reader占着, 多等只是拖住已经用完这个relay的调用方.
+			deadline := time.Now().Add(500 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if !Probe(addr) {
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
 			}
-			time.Sleep(20 * time.Millisecond)
-		}
+		})
 	}
 
 	for i := 0; i < 100; i++ {
-		if relayRunning(addr, canLock) {
+		if relayRunning(addr) {
 			return stop, nil
 		}
 		// 子进程一退出就返回, 让relay自己的校验失败立刻带自己的消息上报,
@@ -292,24 +310,60 @@ func EnsureRelay(exePath, socketFile string, port int, idle time.Duration) (func
 	return nil, fmt.Errorf("relay did not begin listening on %s", addr)
 }
 
-// 判断addr上监听的是不是relay本身, 而不只是占着端口的东西.
-// `canLock`为假时退化成只dial: 平台不支持身份锁就拒绝启动会废掉工具.
-func relayRunning(addr string, canLock bool) bool {
-	if !Probe(addr) {
-		return false
-	}
-	return relaylock.Held(addr) || !canLock
+// 判断`addr`上监听的是不是relay本身; 身份锁是唯一证据, 锁不在就不是我们的.
+func relayRunning(addr string) bool {
+	return Probe(addr) && relaylock.Held(addr)
 }
 
+// 只保留开头的一段: 启动失败会出现在那里, 而relay可能跑数小时且每连接一行日志.
+const maxRelayLogBytes = 8 << 10
+
+// 收集writer输出到固定上限后丢弃多余部分, 长命子进程不会撑大本进程.
+// 可并发写: exec分两个goroutine复制stdout和stderr.
+type boundedBuffer struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	cutoff bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := maxRelayLogBytes - b.buf.Len(); room > 0 {
+		if len(p) <= room {
+			b.buf.Write(p)
+		} else {
+			b.buf.Write(p[:room])
+			b.cutoff = true
+		}
+	} else {
+		b.cutoff = true
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.buf.String()
+	if b.cutoff {
+		s += "\n[earlier output truncated]"
+	}
+	return s
+}
+
+// 带上wait错误, 让被信号杀死的进程与干净退出的可区分.
 func relayStartError(addr, exeName, output string, waitErr error) error {
+	status := ""
+	if waitErr != nil {
+		status = fmt.Sprintf(" (%v)", waitErr)
+	}
 	msg := strings.TrimSpace(output)
 	if msg == "" {
-		if waitErr != nil {
-			return fmt.Errorf("relay exited before listening on %s: %v", addr, waitErr)
-		}
-		return fmt.Errorf("relay exited immediately; run %q to see why", exeName+" serve")
+		return fmt.Errorf("relay exited before listening on %s%s; run %q to see why",
+			addr, status, exeName+" serve")
 	}
-	return fmt.Errorf("relay exited before listening on %s: %s", addr, msg)
+	return fmt.Errorf("relay exited before listening on %s%s: %s", addr, status, msg)
 }
 
 func Probe(addr string) bool {

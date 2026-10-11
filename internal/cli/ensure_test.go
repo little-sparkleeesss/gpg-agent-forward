@@ -34,11 +34,15 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(3)
 	}
 	defer ln.Close()
-	// 真relay会拿身份锁, helper也必须拿: 否则父进程会(正确地)拒绝把这个端口当relay.
-	if _, ok := relaylock.TryLock(ln.Addr().String()); !ok {
+	// 真relay会拿身份锁, helper也得拿: 否则父进程会(正确地)拒绝把这个端口当relay.
+	// `release`函数必须活到helper结束: 丢掉它, 被锁的`*os.File`就不可达, Go的finalizer会在
+	// 下次GC时关掉它, 锁被静默释放而helper还在服务, 父进程会另起relay而不是收养它.
+	keepRelease, ok := relaylock.TryLock(ln.Addr().String(), relaylock.Info{})
+	if !ok {
 		fmt.Fprintln(os.Stderr, "helper lock:", "already held")
 		os.Exit(4)
 	}
+	defer keepRelease()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -48,14 +52,15 @@ func TestHelperProcess(t *testing.T) {
 	}
 }
 
-// 绑loopback端口并拿身份锁, 让调用方把它当真relay; 返回端口.
-func startFakeRelay(t *testing.T) int {
+// 绑loopback端口并拿身份锁, 让调用方把它当真relay; 返回端口. `info`是锁记录的元数据,
+// 调用方据此判断能否收养既有relay; 零值`Info`对应空闲超时已禁用的relay, 正是ssh需要的.
+func startFakeRelay(t *testing.T, info relaylock.Info) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	release, ok := relaylock.TryLock(ln.Addr().String())
+	release, ok := relaylock.TryLock(ln.Addr().String(), info)
 	if !ok {
 		ln.Close()
 		t.Fatal("could not take the relay identity lock")
@@ -116,8 +121,8 @@ func flagValue(args []string, name string) string {
 }
 
 func TestEnsureRelayReportsAChildThatExitsImmediately(t *testing.T) {
-	// 启动即死的relay(如socket文件不可读, 端口被占)必须立刻带上自己的错误信息上报,
-	// 而不是等满超时再报一句误导性的`did not begin listening`.
+	// 启动即死的relay必须立刻带上自己的错误信息上报, 不能等满超时再报误导性的话; 错误里
+	// 既要带子进程自己说的, 也要带退出状态, 被杀的进程才能与干净退出的区分开.
 	startHook = func(exePath string, args []string) *exec.Cmd {
 		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcessCrash")
 		cmd.Env = append(os.Environ(), "GPG_AGENT_FORWARD_CRASH_HELPER=1")
@@ -134,6 +139,9 @@ func TestEnsureRelayReportsAChildThatExitsImmediately(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "socket file is unusable") {
 		t.Errorf("EnsureRelay() error = %v, want it to carry the child's own message", err)
+	}
+	if !strings.Contains(err.Error(), "exit status 1") {
+		t.Errorf("EnsureRelay() error = %v, want it to carry the child's exit status", err)
 	}
 	if elapsed > time.Second {
 		t.Errorf("EnsureRelay() took %v, want it to return as soon as the child exited", elapsed)
@@ -198,7 +206,7 @@ func TestEnsureRelayReturnsNilStopWhenAlreadyRunning(t *testing.T) {
 	helperStarter(t, nil)
 
 	// 已有relay在听: 不能再起第二个, 也不返回`stop`函数.
-	port := startFakeRelay(t)
+	port := startFakeRelay(t, relaylock.Info{SocketFile: "/tmp/sock"})
 
 	stop, err := EnsureRelay("unused", "/tmp/sock", port, 0)
 	if err != nil {
@@ -254,4 +262,36 @@ func TestStopIsIdempotent(t *testing.T) {
 	}
 	stop()
 	stop() // 不能panic
+}
+
+func TestEnsureRelayDoesNotAdoptARelayForAnotherSocketFile(t *testing.T) {
+	// 桥接别的agent的relay会用错密钥签名, 而各项检查都报成功, 绝不能被收养.
+	port := startFakeRelay(t, relaylock.Info{SocketFile: "A"})
+
+	if _, err := EnsureRelay("unused", "B", port, 0); err == nil {
+		t.Error("EnsureRelay() error = nil, want a refusal to reuse a relay for a different socket file")
+	}
+}
+
+func TestEnsureRelayDoesNotAdoptAFiniteIdleRelay(t *testing.T) {
+	// ssh需要不会在会话存续期间到时退出的relay; 收养一个会到时的,
+	// 远端socket会在会话中途指向空.
+	port := startFakeRelay(t, relaylock.Info{IdleTimeout: 15 * time.Minute})
+
+	if _, err := EnsureRelay("unused", "/tmp/sock", port, 0); err == nil {
+		t.Error("EnsureRelay() error = nil, want a refusal to reuse a relay with a finite idle timeout")
+	}
+}
+
+func TestEnsureRelayAdoptsARelayItWouldHaveStarted(t *testing.T) {
+	// socket文件相同且空闲禁用: 这正是ssh会起的那个relay, 应当收养而不是重复起.
+	port := startFakeRelay(t, relaylock.Info{SocketFile: "/tmp/sock"})
+
+	stop, err := EnsureRelay("unused", "/tmp/sock", port, 0)
+	if err != nil {
+		t.Fatalf("EnsureRelay() error = %v, want adoption of a matching relay", err)
+	}
+	if stop != nil {
+		t.Error("EnsureRelay() stop != nil, want nil for a relay it did not start")
+	}
 }

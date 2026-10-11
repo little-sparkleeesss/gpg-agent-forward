@@ -10,12 +10,24 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"gpg-agent-forward/internal/nonce"
 	"gpg-agent-forward/internal/relaylock"
 )
+
+// `New`拿不到身份锁时包装它; 保留为var以便匹配.
+var errLockUnavailable = errors.New("identity lock unavailable")
+
+// 忽略SIGPIPE: relay按需启动, stdout/stderr经管道捕获, 启动它的包装进程可能先退出.
+// 管道读端消失后, 下一行日志即EPIPE; Go运行时默认因SIGPIPE终止进程,
+// 一条被拒连接就会静默杀死relay. 忽略它只丢那行日志.
+func ignoreSIGPIPE() {
+	signal.Ignore(syscall.SIGPIPE)
+}
 
 type Config struct {
 	// SSH拨号的地址, 必须为字面loopback: relay拒绝把agent暴露到其他接口.
@@ -40,7 +52,7 @@ type Relay struct {
 	ln      net.Listener
 	log     *log.Logger
 	once    sync.Once
-	release func() // 释放身份锁; 锁不可用时为nil
+	release func() // 释放身份锁; 可为nil, 使用前须判空
 
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{}
@@ -54,6 +66,8 @@ var ErrNotLoopback = errors.New("relay: listen address must be a literal loopbac
 
 // 创建时立刻绑定监听器: 端口冲突当场报给调用方, 而不是留到之后才发现.
 func New(cfg Config) (*Relay, error) {
+	// 必须先于任何日志设置: 输出管道读端消失后relay仍要服务, 详见`ignoreSIGPIPE`.
+	ignoreSIGPIPE()
 	if err := checkLoopback(cfg.ListenAddr); err != nil {
 		return nil, err
 	}
@@ -64,11 +78,16 @@ func New(cfg Config) (*Relay, error) {
 	if err != nil {
 		return nil, fmt.Errorf("relay: listen on %s: %w", cfg.ListenAddr, err)
 	}
-	// 以实际绑定地址为键取身份锁: 供调用方区分本relay与冒名占端口者;
-	// 拿不到锁不致命, relay照常服务, 只是无法与冒名者区分.
-	release, ok := relaylock.TryLock(ln.Addr().String())
+	// 以实际绑定地址为键取身份锁, 并把socket文件与闲置策略记入其中:
+	// 调用方靠锁识别relay, 靠元数据判断能否安全复用.
+	// 拿不到锁即失败: 无锁relay与冒名者不可分, 调用方都会拒用.
+	release, ok := relaylock.TryLock(ln.Addr().String(), relaylock.Info{
+		SocketFile:  cfg.SocketFile,
+		IdleTimeout: cfg.IdleTimeout,
+	})
 	if !ok {
-		release = nil
+		ln.Close()
+		return nil, fmt.Errorf("relay: claim identity lock for %s: %w", ln.Addr(), errLockUnavailable)
 	}
 	logger := cfg.Logger
 	if logger == nil {
