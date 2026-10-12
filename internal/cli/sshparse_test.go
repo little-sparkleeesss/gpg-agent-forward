@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -47,6 +48,12 @@ func TestSSHDestination(t *testing.T) {
 			name: "bundled value flag mid-group",
 			args: []string{"-4o", "StrictHostKeyChecking=no", "host"},
 			want: "host",
+		},
+		{
+			// 同一个选项的GNU式拼写: 它的值是一个独立参数, 不解析它就会把值当成目的地.
+			name: "--option's value is not the destination",
+			args: []string{"--option", "StrictHostKeyChecking=no", "user@192.0.2.10"},
+			want: "user@192.0.2.10",
 		},
 		{
 			name: "no-value flags bundled",
@@ -183,6 +190,97 @@ func TestParseSSHArgsConnectionFlags(t *testing.T) {
 			args: []string{"-B", "eth0", "-p", "22", "host"},
 			want: []string{"-p", "22"},
 		},
+		{
+			// `-R`和`-L`有长拼写, 只有字母的flag表看不见它; 查询连接上的转发会绑定它正要检查
+			// 的路径, 把刚建出的socket报成占用.
+			name: "forwards spelled as options are dropped too",
+			args: []string{"-o", "RemoteForward=/a:/b", "-oLocalForward=/tmp/l:/tmp/r", "-p", "22", "host"},
+			want: []string{"-p", "22"},
+		},
+		{
+			name: "a dynamic forward is dropped with its value",
+			args: []string{"-o", "DynamicForward=1080", "host"},
+			want: nil,
+		},
+		{
+			name: "an option bundled behind another short flag is read the same way",
+			args: []string{"-4oRemoteForward=/a:/b", "-p", "22", "host"},
+			want: []string{"-4", "-p", "22"},
+		},
+		{
+			// ssh在`=`或空白处拆分关键字和值: `RemoteForward /a:/b`这种写法与
+			// `RemoteForward=/a:/b`等价; 只按`=`拆分会漏掉前者.
+			name: "the space-separated spelling of an option sets the same thing",
+			args: []string{"-o", "RemoteForward /a:/b", "-p", "22", "host"},
+			want: []string{"-p", "22"},
+		},
+		{
+			name: "whitespace before an option's keyword does not hide it",
+			args: []string{"-o", "  RemoteForward = /a:/b", "-p", "22", "host"},
+			want: []string{"-p", "22"},
+		},
+		{
+			name: "keywords are matched without regard to case",
+			args: []string{"-o", "REMOTEFORWARD=/a:/b", "-o", "forkafterauthentication=yes", "host"},
+			want: nil,
+		},
+		{
+			// 用户自己的命令会顶替查询命令; 强制tty把答案变成交互会话的输出 (提示符, 回显,
+			// CRLF), 查询答案的严格解析不是为这种输出写的.
+			name: "a remote command or a forced tty is dropped",
+			args: []string{"-o", "RemoteCommand=uptime", "-o", "RequestTTY=force", "-p", "22", "host"},
+			want: []string{"-p", "22"},
+		},
+		{
+			// ssh对标量取先读到的值, 而本包把`ClearAllForwardings=yes`放在用户参数之前: 用户的值
+			// 赢不了它. 键仍然被丢掉而不是留在向量里, 好让清空不只依赖这条规则.
+			name: "the user's own ClearAllForwardings is dropped",
+			args: []string{"-o", "ClearAllForwardings=no", "-p", "22", "host"},
+			want: []string{"-p", "22"},
+		},
+		{
+			// ssh会跳过选项与关键字之间的一个`=`: 这些写法与普通拼写等效, 而按第一个`=`切分的
+			// 过滤器会从它们里读出空关键字并放行.
+			name: "one leading '=' before the keyword changes nothing for ssh or for us",
+			args: []string{"-o", "=RemoteForward=/a:/b", "-o", "  =DynamicForward=1080", "-o", "= RemoteCommand=uptime", "-o=RequestTTY=force", "-p", "22", "host"},
+			want: []string{"-p", "22"},
+		},
+		{
+			name: "the clearing option is dropped in the leading-'=' spelling too",
+			args: []string{"-o=ClearAllForwardings=no", "host"},
+			want: nil,
+		},
+		{
+			// 两个`=`下ssh什么也不设置, 查询也就照原样放过它. 丢掉在这里无害, 但保留才与会话
+			// 一致.
+			name: "two leading '=' set nothing in ssh and so leave nothing to filter",
+			args: []string{"-o", "==RemoteForward=/a:/b", "-p", "22", "host"},
+			want: []string{"-o", "==RemoteForward=/a:/b", "-p", "22"},
+		},
+		{
+			// `-t`是`RequestTTY`自己的拼写, 与`RequestTTY`是同一个选项: pty会把一次性
+			// 答案变成交互输出; `-tt`只是同一个flag两次.
+			name: "a forced tty is dropped in its short spelling too",
+			args: []string{"-t", "-4tt", "-p", "22", "host"},
+			want: []string{"-4", "-p", "22"},
+		},
+		{
+			name: "options this package has no quarrel with are kept as written",
+			args: []string{"-o", "StrictHostKeyChecking=accept-new", "-oForwardAgent=yes", "-o", "ExitOnForwardFailure=yes", "host"},
+			want: []string{"-o", "StrictHostKeyChecking=accept-new", "-oForwardAgent=yes", "-o", "ExitOnForwardFailure=yes"},
+		},
+		{
+			// ssh自己拒绝`--option`, 这种拼写做不出可用的连接; 在这里读它是不让值被当成目的地,
+			// 并让同一套关键字过滤作用到它.
+			name: "--option is read as the option it spells",
+			args: []string{"--option=RemoteForward=/a:/b", "--option", "RemoteCommand=uptime", "-p", "22", "host"},
+			want: []string{"-p", "22"},
+		},
+		{
+			name: "--option with a keyword this package keeps is passed through as written",
+			args: []string{"--option=ConnectTimeout=5", "host"},
+			want: []string{"--option=ConnectTimeout=5"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -202,6 +300,206 @@ func TestParseSSHArgsDoesNotMutateInput(t *testing.T) {
 	ParseSSHArgs(in)
 	if !equalStrings(in, []string{"-N", "-p", "22", "host"}) {
 		t.Errorf("input mutated: %q", in)
+	}
+}
+
+// `sshCommandArgs`必须清掉配置文件要求, 参数过滤看不见的转发, 且不让用户的值压过
+// 它: 标量选项ssh取先读到的值, 所以清空值要放在向量最前, 而不是用户参数之后.
+func TestSSHCommandArgsClearsForwardingsOnTheOneShotConnection(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			name: "no flags at all",
+			args: []string{"host"},
+			want: []string{"-o", "ClearAllForwardings=yes", "host", "true"},
+		},
+		{
+			name: "the clear goes ahead of every option the user wrote, before the destination",
+			args: []string{"-o", "RemoteForward=/a:/b", "-p", "45731", "user@host"},
+			want: []string{"-o", "ClearAllForwardings=yes", "-p", "45731", "user@host", "true"},
+		},
+		{
+			name: "a value of the user's for the same key cannot come first",
+			args: []string{"-o", "ClearAllForwardings=no", "host"},
+			want: []string{"-o", "ClearAllForwardings=yes", "host", "true"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := sshCommandArgs(tt.args, "true")
+			if err != nil {
+				t.Fatalf("sshCommandArgs(%q) error = %v", tt.args, err)
+			}
+			if !equalStrings(got, tt.want) {
+				t.Errorf("sshCommandArgs(%q) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+// `sshEffectiveConfig`用真ssh的`-G`模式问一组参数的含义, 返回按选项名归并的配置.
+// `-G`不连接任何地方, 又是唯一读真实连接同一份选项表的办法; `-F`空配置文件让答案
+// 只关乎向量本身, 不受测试机`ssh_config`影响. 自带配置文件的测试详见`sshEffectiveConfigWith`.
+func sshEffectiveConfig(t *testing.T, args []string) map[string][]string {
+	t.Helper()
+	return sshEffectiveConfigWith(t, "", args)
+}
+
+// `sshEffectiveConfigWith`就是`sshEffectiveConfig`加一份测试自己的配置文件:
+// ssh从它读到的值与向量选项按同一规则合并, 本包设的`ClearAllForwardings`正是为压过它.
+func sshEffectiveConfigWith(t *testing.T, configFile string, args []string) map[string][]string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the vectors these tests use carry POSIX socket paths, which a Windows ssh parses its own way")
+	}
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skipf("no ssh client on PATH to ask what the arguments amount to: %v", err)
+	}
+	writtenConfig := filepath.Join(t.TempDir(), "ssh_config")
+	if err := os.WriteFile(writtenConfig, []byte(configFile), 0o600); err != nil {
+		t.Fatalf("write the ssh config for the test: %v", err)
+	}
+
+	cmd := exec.Command(sshBin, append([]string{"-F", writtenConfig, "-G"}, args...)...)
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ssh -G %q: %v: %s", args, err, strings.TrimSpace(stderr.String()))
+	}
+
+	config := map[string][]string{}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		name, value, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		config[name] = append(config[name], strings.TrimSpace(value))
+	}
+	return config
+}
+
+func oneValue(t *testing.T, config map[string][]string, name string) string {
+	t.Helper()
+	values := config[name]
+	if len(values) != 1 {
+		t.Fatalf("ssh reported %s = %q, want exactly one value", name, values)
+	}
+	return values[0]
+}
+
+// 一次性连接由用户自己的参数拼成, 所以要紧的是ssh怎么理解这组向量: 幸存到里面的
+// 选项会改变查询的行为, 而查询的答案正是会话据以校验的东西.
+func TestOneShotConnectionForwardsNothing(t *testing.T) {
+	// 一条像样的会话命令行: agent socket的转发, 后台化请求, 用户自己的命令, 两种拼写的
+	// 强制tty, 被关掉的`ClearAllForwardings`, 一个端口. 在查询连接上前三个直接搞坏它
+	// (绑定正要检查的socket, 主机从此显得忙), tty和用户的清空值则与本包设的值打架.
+	userArgs := []string{
+		"-o", "RemoteForward=/run/user/1000/gnupg/S.gpg-agent:/tmp/windows-agent",
+		"-o", "LocalForward 1234 localhost:22",
+		"-oDynamicForward=1080",
+		"-oForkAfterAuthentication=yes",
+		"-o", "RemoteCommand=uptime",
+		"-o", "RequestTTY=force",
+		"-t",
+		"-o", "ClearAllForwardings=no",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-p", "45731",
+		"user@192.0.2.10",
+	}
+	args, err := sshCommandArgs(userArgs, "gpgconf --list-dirs agent-socket")
+	if err != nil {
+		t.Fatalf("sshCommandArgs(%q) error = %v", userArgs, err)
+	}
+	config := sshEffectiveConfig(t, args)
+
+	// 转发必须整个去掉, 不能靠覆盖: `ClearAllForwardings`是标量, 而转发是加到列表里,
+	// 后写的值挤不掉用户先写的.
+	for _, name := range []string{"remoteforward", "localforward", "dynamicforward"} {
+		if values := config[name]; len(values) != 0 {
+			t.Errorf("the effective config still forwards through %s: %q", name, values)
+		}
+	}
+	if got := oneValue(t, config, "clearallforwardings"); got != "yes" {
+		t.Errorf("clearallforwardings = %q, want yes: it is what clears the forwards config files ask for", got)
+	}
+	if got := oneValue(t, config, "requesttty"); got != "auto" {
+		t.Errorf("requesttty = %q, want ssh's own default of auto: a pty turns the query's answer into an interactive session's output", got)
+	}
+	if got := oneValue(t, config, "forkafterauthentication"); got != "no" {
+		t.Errorf("forkafterauthentication = %q, want no: a query that goes to the background returns no answer", got)
+	}
+	if got := oneValue(t, config, "batchmode"); got != "no" {
+		t.Errorf("batchmode = %q, want no: a host that can only be reached with a password would never pass the check", got)
+	}
+	if got := config["remotecommand"]; len(got) != 0 && (len(got) != 1 || got[0] != "none") {
+		t.Errorf("remotecommand = %q, want it unset: the query's own command is the one that has to run", got)
+	}
+	// 查询建立的连接仍然是用户的: 同一目的地, 同一端口, 同一套到达主机的选项.
+	if got := oneValue(t, config, "hostname"); got != "192.0.2.10" {
+		t.Errorf("hostname = %q, want the destination the user named", got)
+	}
+	if got := oneValue(t, config, "user"); got != "user" {
+		t.Errorf("user = %q, want the user the user named", got)
+	}
+	if got := oneValue(t, config, "port"); got != "45731" {
+		t.Errorf("port = %q, want 45731: the query must reach the same port as the session", got)
+	}
+	if got := oneValue(t, config, "stricthostkeychecking"); got != "accept-new" {
+		t.Errorf("stricthostkeychecking = %q, want the user's own accept-new: an option this package keeps has to reach the query", got)
+	}
+}
+
+// 被过滤的选项是丢掉而不是覆盖, 这是真ssh那一侧的依据: 标量选项取先读到的值, 追加在
+// 用户值之后的会输; 转发是加到列表, 根本无法被挤掉.
+func TestOptionsCouldNotHaveBeenOverriddenInsteadOfDropped(t *testing.T) {
+	scalar := sshEffectiveConfig(t, []string{"-o", "ClearAllForwardings=no", "-o", "ClearAllForwardings=yes", "host", "true"})
+	if got := oneValue(t, scalar, "clearallforwardings"); got != "no" {
+		t.Errorf("clearallforwardings = %q, want the first value (no)", got)
+	}
+
+	// 同一条规则也是清空值放向量最前的原因: 那里没有ssh后来读到的值能关掉清空.
+	ahead := sshEffectiveConfig(t, []string{"-o", "ClearAllForwardings=yes", "-o", "ClearAllForwardings=no", "host", "true"})
+	if got := oneValue(t, ahead, "clearallforwardings"); got != "yes" {
+		t.Errorf("clearallforwardings = %q, want yes: the first value wins wherever it is written", got)
+	}
+
+	forwards := sshEffectiveConfig(t, []string{"-o", "RemoteForward=/a:/b", "-o", "RemoteForward=/c:/d", "host", "true"})
+	if got := forwards["remoteforward"]; len(got) != 2 {
+		t.Errorf("ssh kept %q of two RemoteForward values, want both: a forward adds to a list", got)
+	}
+}
+
+// 配置文件要的转发在向量里根本没有, 参数过滤看不见, 只有本包加的清空选项能碰到它们.
+// 向量里还有过滤器必须读懂的拼写: ssh接受选项与关键字间的单个`=`, 只按第一个`=`
+// 切分会读出空关键字 - 转发和用户的清空值都会到达ssh; 清空值在向量最前, 用户的值到不了它前面.
+func TestOneShotConnectionClearsTheForwardsAConfigFileAsksFor(t *testing.T) {
+	const configFile = "Host *\n" +
+		"  RemoteForward /cfg-socket:/cfg-remote-socket\n" +
+		"  LocalForward 1234 localhost:22\n"
+	userArgs := []string{
+		"-o=RemoteForward=/leaked-socket:/leaked-remote-socket",
+		"-o", "=LocalForward 1234 localhost:22",
+		"-o=ClearAllForwardings=no",
+		"-p", "45731",
+		"user@192.0.2.10",
+	}
+	args, err := sshCommandArgs(userArgs, "gpgconf --list-dirs agent-socket")
+	if err != nil {
+		t.Fatalf("sshCommandArgs(%q) error = %v", userArgs, err)
+	}
+	config := sshEffectiveConfigWith(t, configFile, args)
+
+	for _, name := range []string{"remoteforward", "localforward", "dynamicforward"} {
+		if values := config[name]; len(values) != 0 {
+			t.Errorf("the effective config still forwards through %s: %q", name, values)
+		}
+	}
+	if got := oneValue(t, config, "clearallforwardings"); got != "yes" {
+		t.Errorf("clearallforwardings = %q, want yes: with it off, the config file's own forwards are back", got)
 	}
 }
 

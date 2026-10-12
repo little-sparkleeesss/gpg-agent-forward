@@ -36,15 +36,56 @@ var sshFlagTakesValue = map[byte]bool{
 	'w': true, // tun设备
 }
 
-// sshFlagDroppedForQuery: 不能带进探测连接的选项.
-// `-N`和`-f`会让远端命令跑不起来, 控制类选项会改变连接的建立方式, 转发会与中继自己的`-R`撞车.
+// sshFlagDroppedForQuery: 不能带进探测连接的单字母选项.
+// `-N`和`-f`会让远端命令跑不起来, `-t`会索要pty把回答变成交互输出,
+// 控制类选项会改变连接的建立方式, 转发会与中继自己的`-R`撞车.
+// `-o`的长拼写不在这里判断, 详见 `sshOptionDroppedForQuery`.
 var sshFlagDroppedForQuery = map[byte]bool{
 	'B': true, 'b': true, 'D': true, 'L': true, 'R': true, 'W': true, 'w': true,
-	'f': true, 'N': true, 'M': true, 'S': true, 'O': true, 'n': true,
+	'f': true, 'N': true, 'M': true, 'S': true, 'O': true, 'n': true, 't': true,
 }
+
+// sshOptionDroppedForQuery: 表里的关键字用ssh比较时的小写拼写.
+// 转发类关键字是`-R`/`-L`/`-D`的另一条路: 探测连接自己建转发会绑上正要检查的路径, 查询就把
+// 主机判成忙, 于是每次都被拒绝; 丢弃而非覆盖: ssh对标量取先读到的值, 本包后写的挤不掉;
+// 清空值由`sshCommandArgs`写在用户参数之前, 用户的`-o ClearAllForwardings=no`盖不过它;
+// forward逐条追加, 后加的也挤不掉; 其余关键字改变连接做什么: 用户的命令会顶掉查询的,
+// `ForkAfterAuthentication`让查询进后台而没有回答可读, 强制tty会变成交互输出.
+var sshOptionDroppedForQuery = map[string]bool{
+	"remoteforward":           true,
+	"localforward":            true,
+	"dynamicforward":          true,
+	"forkafterauthentication": true,
+	"remotecommand":           true,
+	"clearallforwardings":     true,
+	"requesttty":              true,
+}
+
+// sshOptionKey: 取出`-o`参数设置的关键字, 小写.
+// ssh不要求"Key=Value"拼写: 关键字前依次跳过空白, 一个等号和空白, 关键字在第一个等号或空白处结束,
+// 所以`-o "RemoteForward /a:/b"`与`-o "=RemoteForward=/a:/b"`都等价于`-o RemoteForward=/a:/b`.
+// 只跳一个等号: 两个时ssh什么都不设, 这里返回空关键字, 原样放过.
+func sshOptionKey(option string) string {
+	option = strings.TrimLeft(option, sshOptionWhitespace)
+	option = strings.TrimPrefix(option, "=")
+	option = strings.TrimLeft(option, sshOptionWhitespace)
+	if i := strings.IndexFunc(option, func(r rune) bool {
+		return r == '=' || strings.ContainsRune(sshOptionWhitespace, r)
+	}); i >= 0 {
+		option = option[:i]
+	}
+	return strings.ToLower(option)
+}
+
+// sshOptionWhitespace: ssh自己的选项解析器按C locale的`isspace()`读的空白, 只有这六个字符.
+const sshOptionWhitespace = " \t\n\v\f\r"
+
+// sshClearAllForwardings: 排在最前, 连配置文件里的转发一起清, 兼作过滤器认不出的拼写的兜底.
+const sshClearAllForwardings = "ClearAllForwardings=yes"
 
 // ParseSSHArgs: 拆出目标主机, 以及值得复用给第二条连接的flag子集.
 // 不在目标主机处停下解析: ssh会重排参数, 选项可以跟在主机后面 (`ssh host -p 2222`).
+// 一种选项的每种拼写都丢掉: 表里的字母, `-o`设的关键字 (附着/分开/带前导`=`都算), 以及`--option`.
 func ParseSSHArgs(args []string) (destination string, connFlags []string, err error) {
 	found := false
 	for i := 0; i < len(args); {
@@ -68,6 +109,28 @@ func ParseSSHArgs(args []string) (destination string, connFlags []string, err er
 			return destination, connFlags, nil
 		}
 
+		// `--option`是`-o`的GNU式拼写 (ssh自己会拒掉它), 这里照样读它的值:
+		// 关键字要和其他选项一样被过滤, 更要紧的是别让`--option K=V host`把K=V当成主机.
+		if a == "--option" || strings.HasPrefix(a, "--option=") {
+			separate := a == "--option"
+			value := strings.TrimPrefix(a, "--option=")
+			if separate && i+1 < len(args) {
+				value = args[i+1]
+			}
+			if !sshOptionDroppedForQuery[sshOptionKey(value)] {
+				connFlags = append(connFlags, a)
+				if separate && i+1 < len(args) {
+					connFlags = append(connFlags, value)
+				}
+			}
+			if separate {
+				i += 2
+				continue
+			}
+			i++
+			continue
+		}
+
 		group := a[1:]
 		consumedNext := false
 		for j := 0; j < len(group); j++ {
@@ -80,7 +143,18 @@ func ParseSSHArgs(args []string) (destination string, connFlags []string, err er
 				}
 				continue
 			}
-			if attached := group[j+1:]; attached != "" {
+			attached := group[j+1:]
+			// `-o`按它设置的关键字取舍, 不按字母.
+			if c == 'o' {
+				value := attached
+				if value == "" && i+1 < len(args) {
+					value = args[i+1]
+				}
+				if sshOptionDroppedForQuery[sshOptionKey(value)] {
+					keep = false
+				}
+			}
+			if attached != "" {
 				if keep {
 					connFlags = append(connFlags, "-"+string(c)+attached)
 				}
@@ -323,13 +397,15 @@ const sshWaitDelay = 200 * time.Millisecond
 // 会话自己的ssh不受此限,它持续到会话结束.
 const sshQueryTimeout = 20 * time.Second
 
-// 构造跑remoteCommand的ssh参数,丢掉会阻止远端命令运行的选项
+// 构造一次性查询的ssh参数:丢掉会阻止远端命令运行的选项,并清掉会改变主机面貌的转发.
+// `ClearAllForwardings`放最前:取舍详见`sshClearAllForwardings`,首值详见`sshOptionDroppedForQuery`.
 func sshCommandArgs(sshArgs []string, remoteCommand string) ([]string, error) {
 	destination, connFlags, err := ParseSSHArgs(sshArgs)
 	if err != nil {
 		return nil, err
 	}
-	args := make([]string, 0, len(connFlags)+2)
+	args := make([]string, 0, len(connFlags)+4)
+	args = append(args, "-o", sshClearAllForwardings)
 	args = append(args, connFlags...)
 	args = append(args, destination, remoteCommand)
 	return args, nil
