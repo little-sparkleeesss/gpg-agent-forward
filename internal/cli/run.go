@@ -216,7 +216,7 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	cmd := exec.Command("ssh", BuildSSHArgs(sshArgs, *remoteSocket, *port)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, errOut
 	// ssh消失后限制等其输出管道的时间: 否则持有管道的ssh后代 (ProxyCommand,
-	// wrapper, sshd fork的守护进程) 会决定会话何时结束, 收尾和远端清理都得等它.
+	// wrapper, sshd fork的守护进程) 会决定会话何时结束, 收尾得等它.
 	// 值与一次性远端命令相同 (详见sshWaitDelay), 代价也一样: 超出该时间的后代输出会丢.
 	cmd.WaitDelay = sshWaitDelay
 	fmt.Fprintf(errOut, "gpg-agent-forward: remote socket %s -> 127.0.0.1:%d\n", *remoteSocket, *port)
@@ -228,26 +228,12 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	defer signals.stop()
 	sessionErr := runSessionSSH(cmd, signals)
 
-	// 先结束会话再做远端清理, 顺序不能反: 清理自己开ssh连接并可能占用至多`remoteCleanupTimeout`.
-	// 清理期间watchdog若还在, 会为已结束的会话补起没人要的relay, deferred shutdown之后只能再杀掉它.
-	// 信号转发未撤: SIGINT/SIGTERM/SIGHUP被消费而ssh已退出, kill会被吞掉; 两者幂等, deferred的仍兜底.
+	// 会话结束, 为它动作的这两样随之收摊, 而不是留给deferred调用.
+	// watchdog会为没人要的会话补起relay, 之后只有deferred shutdown能再杀掉它.
+	// 信号转发未撤: 已消费SIGINT/SIGTERM/SIGHUP而ssh已退出, teardown期间的kill会被吞掉; 两者幂等.
 	signals.stop()
 	keepAlive.shutdown()
 
-	// sshd负责清理它为转发绑定的socket, 但并不总会清: 死socket留在agent路径
-	// 上会挡住下一次调用.尽力而为且有上限, 用户正准备离开.
-	// 从未连上的会话跳过清理, 失败也只在会话成功时报告 (详见remoteCleanupNeeded).
-	if remoteCleanupNeeded(sessionErr) {
-		cleanup := func(sshArgs []string, remoteCommand string) (string, error) {
-			return runSSHCommandWithin(remoteCleanupTimeout, sshArgs, remoteCommand)
-		}
-		err := RemoveRemoteSocketAfterSession(sshArgs, *remoteSocket, cleanup)
-		if err != nil && sessionErr == nil {
-			// 只在会话成功时警告: 会话失败时那条错误才是消息, 且由调用方在本函数返回后
-			// 打印, 这里的警告会把真正的错误顶出视野; 留下的socket由下次调用的预检回收并报告.
-			fmt.Fprintf(errOut, "gpg-agent-forward: could not clean up %s on the remote host: %v\n", *remoteSocket, err)
-		}
-	}
 	return sessionErr
 }
 
@@ -261,35 +247,13 @@ func runSessionSSH(cmd *exec.Cmd, signals signalForwarder) error {
 	signals.attach(cmd.Process)
 
 	err := cmd.Wait()
-	// ssh退0但后代仍占着exec建的stderr管道, WaitDelay到点关掉它: 会话是正常结束的.
-	// 报成失败会给成功的会话打错误并让CLI非零退出, 还让`remoteCleanupNeeded`误判为从未连上而跳过清理.
-	// `ErrWaitDelay`只在状态本为成功时取代它, 不掩盖真实失败: 真失败仍是Wait报的状态.
+	// ssh退0, 但它的后代仍占着exec为ssh建的stderr管道, Wait在WaitDelay后关掉
+	// 管道并以ErrWaitDelay代替状态; 退0的会话是正常结束的, 活过它的后代不是会话本身.
+	// 报成失败会给成功的会话打错误并让CLI非零退出; ErrWaitDelay只代替成功状态, 不掩盖真实失败.
 	if errors.Is(err, exec.ErrWaitDelay) {
 		return nil
 	}
 	return err
-}
-
-// ssh致命错误 (主机不可达, 密钥被拒, 主机密钥变了, 转发没建起来) 都退255 (ssh(1)记载出错则为255).
-// 本命令加了`ExitOnForwardFailure=yes`, 绑不上远端socket的会话也退255; 这类会话没有socket需要清理.
-// 远端命令也可能退255, 那只会少一次清理提示, 下次调用的预检会回收并报告.
-const sshConnectFailureExitCode = 255
-
-// 只有没跑成的会话为false: 进程没起来, 或ssh自己的错误退出码 (详见sshConnectFailureExitCode).
-// 这两种没有socket可清, 再连一次只会让刚失败的主机再超时一遍, 要口令或二次验证的还会再问一次.
-// 其余都清理, 信号也算: Ctrl-C或kill掉的会话正是会留下转发socket的那种.
-func remoteCleanupNeeded(sessionErr error) bool {
-	if sessionErr == nil {
-		return true
-	}
-	var exitErr *exec.ExitError
-	if !errors.As(sessionErr, &exitErr) {
-		// 不是进程退出: ssh根本没起来 (找不到或不可执行), 没有会话也就没有socket.
-		return false
-	}
-	// 被信号终结时`ExitCode`为-1 (`os.ProcessState.ExitCode`), 这正是要清理的情形,
-	// 所以只有ssh自用的那个退出码才跳过清理.
-	return exitErr.ExitCode() != sshConnectFailureExitCode
 }
 
 func validateSocketFile(path string) error {

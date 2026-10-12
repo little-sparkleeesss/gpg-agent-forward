@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-// 把SIGINT, SIGTERM, SIGHUP转发给会话的ssh: 杀wrapper或Ctrl-C要能到达ssh, 中继清理才会执行.
+// 把SIGINT, SIGTERM, SIGHUP转发给会话的ssh: 杀wrapper或Ctrl-C要能结束会话, 不等ssh自己结束.
 // handler先于ssh启动安装, 详见`forwardSignalsImpl`; 窗口期信号先挂起, 交接时补发.
 type posixSignalForwarder struct {
 	// 接收runtime投递的信号: 必须有缓冲, 这是`signal.Notify`对不能阻塞的通道的要求.

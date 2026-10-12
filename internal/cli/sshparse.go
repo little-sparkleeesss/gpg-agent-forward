@@ -312,20 +312,16 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommand
 	}
 }
 
-// 清理会话结束后留在远端的转发socket,让下次从干净路径开始.
-// 尽力而为,留下东西不算错误;活socket同样不碰,那时它属于正在用该路径的人.
-func RemoveRemoteSocketAfterSession(sshArgs []string, remoteSocket string, run SSHCommandRunner) error {
-	_, err := probeRemoteSocket(sshArgs, remoteSocket, run)
-	return err
-}
-
-// 会话结束后的清理限时:用户已在退出,不因远端不应答而卡住
-const remoteCleanupTimeout = 5 * time.Second
-
 // `sshWaitDelay`:ssh进程消失后Wait最多再等多久它的输出管道.ssh启动的命令可能比它活得久
 // (`ProxyCommand`,wrapper,sshd认证后fork的守护进程),后代持有继承的stdout,复制管道的
 // goroutine要等最后一个持有者退出;不设它超时杀不掉等待,等于没有超时.
 const sshWaitDelay = 200 * time.Millisecond
+
+// `sshQueryTimeout`:一次性查询的时限,覆盖整次调用(含ssh自己的连接),发现连接与每个探针.
+// 远端只跑几条shell命令:探针读两张socket表.余量留给负载高的主机,
+// 20秒足够放弃完全不答的主机.预检跑在信号处理安装之前,不返回的查询无法被中断.
+// 会话自己的ssh不受此限,它持续到会话结束.
+const sshQueryTimeout = 20 * time.Second
 
 // 构造跑remoteCommand的ssh参数,丢掉会阻止远端命令运行的选项
 func sshCommandArgs(sshArgs []string, remoteCommand string) ([]string, error) {
@@ -339,6 +335,8 @@ func sshCommandArgs(sshArgs []string, remoteCommand string) ([]string, error) {
 	return args, nil
 }
 
+// remoteCommand的runner,超时同`runSSHQuery`的`sshQueryTimeout`:`run.go`的ssh子命令把它交给
+// `CheckRemoteSocketFree`作探针的runner,不返回的探针不能挂住整个调用;不限时用`runSSHQueryContext`.
 func runSSHCommand(sshArgs []string, remoteCommand string) (string, error) {
 	args, err := sshCommandArgs(sshArgs, remoteCommand)
 	if err != nil {
@@ -347,31 +345,30 @@ func runSSHCommand(sshArgs []string, remoteCommand string) (string, error) {
 	return runSSHQuery(args)
 }
 
-// 给remoteCommand加截止时间:到点后放弃ssh及其输出管道.
-// 零值表示立即超时而非"不限时",故调用方一律传正数,不限时走`runSSHCommand`.
-func runSSHCommandWithin(timeout time.Duration, sshArgs []string, remoteCommand string) (string, error) {
-	args, err := sshCommandArgs(sshArgs, remoteCommand)
-	if err != nil {
-		return "", err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func runSSHQuery(args []string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sshQueryTimeout)
 	defer cancel()
 	return runSSHQueryContext(ctx, args)
 }
 
-func runSSHQuery(args []string) (string, error) {
-	return runSSHQueryContext(context.Background(), args)
-}
-
-// 在ctx下跑ssh并返回标准输出.一次性远端命令只在这里启动ssh,
-// 故超时与等待延迟也只在这一处施加.
+// 一次性远端命令只有这里启动ssh,超时与等待延迟都在这一处施加.
+// WaitDelay截断的等待不是失败的查询:只有ssh成功退出而它留下的进程仍持有输出管道时
+// 才报`ErrWaitDelay`,已收集的输出就是ssh的回答;无判定行不等于判定,两个调用方都拒绝.
+// 两个流都走有界缓冲(同中继日志),话痨主机撑不大本进程;缓冲留尾部,而答案恰在尾部.
 func runSSHQueryContext(ctx context.Context, args []string) (string, error) {
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.WaitDelay = sshWaitDelay
-	var stdout, stderr strings.Builder
+	var stdout, stderr boundedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !errors.Is(err, exec.ErrWaitDelay) {
+		// 超时的截止时间先以信号到达这里:Wait优先报被杀进程的退出状态而非ctx的错误,
+		// 死于信号的进程没有退出码(-1);"signal: killed"本身不说明原因,故并列ctx错误;
+		// 保持包装,调用方能分辨这是超时而非ssh自己的判定.
+		var exitErr *exec.ExitError
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.As(err, &exitErr) && exitErr.ExitCode() == -1 {
+			err = fmt.Errorf("%w: %w", err, ctxErr)
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg != "" {
 			return "", fmt.Errorf("%w: %s", err, msg)

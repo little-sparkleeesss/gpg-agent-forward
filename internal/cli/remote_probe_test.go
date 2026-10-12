@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 // 探针是POSIX shell命令, 故这些测试用`sh`真跑并读输出, 不做命令文本匹配:
@@ -647,27 +646,4 @@ func TestRemoteSocketProbeMatchesWholeAddressFields(t *testing.T) {
 			t.Error("a live socket was removed because its address ended a line")
 		}
 	})
-}
-
-func TestRunSSHCommandWithinBoundsTheWaitOnAPipeHolder(t *testing.T) {
-	// 替身会起一个持有stdout的后代并让自己继续存活: 这次调用只能由deadline结束,
-	// 管道的等待由`WaitDelay`兜住.
-	if runtime.GOOS == "windows" {
-		t.Skip("the stand-in ssh is a shell script")
-	}
-	dir := t.TempDir()
-	script := "#!/bin/sh\nsleep 30 &\nsleep 30\n"
-	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write the stand-in ssh: %v", err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	const deadline = 1 * time.Second
-	start := time.Now()
-	if _, err := runSSHCommandWithin(deadline, []string{"host"}, "true"); err == nil {
-		t.Error("runSSHCommandWithin() error = nil, want the deadline reported")
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("the call took %v with a %v deadline: the wait on ssh's output pipes is unbounded when a descendant holds them", elapsed, deadline)
-	}
 }

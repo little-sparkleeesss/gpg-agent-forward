@@ -1,8 +1,14 @@
 package cli
 
 import (
+	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestSSHDestination(t *testing.T) {
@@ -324,4 +330,193 @@ func containsString(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// 下面的测试真的拉起查询路径的ssh: `PATH`上的替身ssh就是`runSSHQueryContext`会启动的
+// 二进制. 场景真实: `ProxyCommand`, 包装脚本, 登录后fork的sshd都会留下继承stdout的
+// 后代进程, 它在ssh退出后仍攥着管道不放.
+
+func standInSSHPath(t *testing.T, script string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+		t.Fatalf("write the stand-in ssh: %v", err)
+	}
+	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
+}
+
+func requireStandInSSH(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+}
+
+// `pipeHolder`是继承ssh stdout的后代进程, 比启动它的shell活得久: shell退出后它仍开着
+// 管道写端, `exec`里拷贝stdout的goroutine一直读不到头.
+const pipeHolder = "sleep 30 &\n"
+
+func TestRunSSHQueryKeepsTheOutputWhenADescendantHoldsThePipe(t *testing.T) {
+	// ssh退出0且已打出答案, 遗留的后代攥着继承的stdout: 等待被`WaitDelay`截断, `exec`报
+	// `ErrWaitDelay`, 命令本身成功. 因它丢弃输出会把答过话的主机报成连不上.
+	requireStandInSSH(t)
+	t.Setenv("PATH", standInSSHPath(t, "echo "+socketAbsentMarker+"\n"+pipeHolder+"exit 0\n"))
+
+	out, err := runSSHQuery([]string{"host", "true"})
+	if err != nil {
+		t.Fatalf("runSSHQuery() error = %v, want the query to succeed: ssh exited 0", err)
+	}
+	if !strings.Contains(out, socketAbsentMarker) {
+		t.Errorf("runSSHQuery() output = %q, want the verdict ssh printed", out)
+	}
+}
+
+func TestCheckRemoteSocketFreeAcceptsAHostThatAnsweredBeforeThePipeWasHeld(t *testing.T) {
+	// 调用方看到的同一次运行: 探针答了话, 路径就是空的, 会话可以开始. 把攥着的管道读成
+	// 探针失败, 会拒绝一台正常工作的主机.
+	requireStandInSSH(t)
+	t.Setenv("PATH", standInSSHPath(t, "echo "+socketAbsentMarker+"\n"+pipeHolder+"exit 0\n"))
+
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runSSHCommand)
+	if err != nil {
+		t.Fatalf("CheckRemoteSocketFree() error = %v, want nil: the probe answered", err)
+	}
+	if state != socketFree {
+		t.Errorf("state = %v, want socketFree", state)
+	}
+}
+
+func TestDiscoverRemoteSocketKeepsThePathWhenADescendantHoldsThePipe(t *testing.T) {
+	// 发现是同一种查询换了个命令的输出: 路径来自主机的答话, 没有它会话根本起不来.
+	requireStandInSSH(t)
+	const path = "/run/user/1000/gnupg/S.gpg-agent"
+	t.Setenv("PATH", standInSSHPath(t, "echo "+path+"\n"+pipeHolder+"exit 0\n"))
+
+	got, err := DiscoverRemoteSocket([]string{"host"}, runSSHQuery)
+	if err != nil {
+		t.Fatalf("DiscoverRemoteSocket() error = %v, want the path the host reported", err)
+	}
+	if got != path {
+		t.Errorf("path = %q, want %q", got, path)
+	}
+}
+
+func TestCheckRemoteSocketFreeStillRefusesWhenNothingWasReported(t *testing.T) {
+	// 反例: 什么都没打印就留下攥管道后代的主机, 等于什么也没报告. 收到过的
+	// 输出不等于有答案; 路径仍是未检查, 调用方必须拒绝.
+	requireStandInSSH(t)
+	t.Setenv("PATH", standInSSHPath(t, pipeHolder+"exit 0\n"))
+
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runSSHCommand)
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the probe reported nothing")
+	}
+	if state != socketUnreported {
+		t.Errorf("state = %v, want socketUnreported", state)
+	}
+	if !strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
+	}
+
+	if _, err := DiscoverRemoteSocket([]string{"host"}, runSSHQuery); err == nil {
+		t.Error("DiscoverRemoteSocket() error = nil, want a refusal when the host reported no path")
+	}
+}
+
+func TestRunSSHQueryStillFailsWhenSSHFails(t *testing.T) {
+	// `ErrWaitDelay`只关乎管道: 命令失败时不能套用保留成功命令输出的那条分支,
+	// 无论管道被谁攥着.
+	requireStandInSSH(t)
+
+	t.Run("a non-zero exit is still an error with a descendant holding the pipe", func(t *testing.T) {
+		t.Setenv("PATH", standInSSHPath(t, "echo "+socketAbsentMarker+"\n"+pipeHolder+"exit 1\n"))
+		if _, err := runSSHQuery([]string{"host", "true"}); err == nil {
+			t.Error("runSSHQuery() error = nil, want the failing exit status reported")
+		}
+	})
+
+	t.Run("ssh's own error text is still reported", func(t *testing.T) {
+		t.Setenv("PATH", standInSSHPath(t, "echo 'Permission denied (publickey).' >&2\nexit 255\n"))
+		_, err := runSSHQuery([]string{"host", "true"})
+		if err == nil {
+			t.Fatal("runSSHQuery() error = nil, want ssh's failure reported")
+		}
+		if !strings.Contains(err.Error(), "Permission denied") {
+			t.Errorf("error %v should carry what ssh said", err)
+		}
+	})
+}
+
+// `noisyAnswer`是说得远多于所需的远端 (登录横幅, 会回显的rc文件): 无论它愿意说
+// 多少, 本进程保留的输出必须有界.
+const noisyAnswer = `i=0; while [ $i -lt 2000 ]; do echo "noise line $i"; i=$((i+1)); done`
+
+func TestRunSSHQueryBoundsTheOutputItCollects(t *testing.T) {
+	requireStandInSSH(t)
+
+	t.Run("stdout", func(t *testing.T) {
+		t.Setenv("PATH", standInSSHPath(t, "echo "+socketAbsentMarker+"\n"+noisyAnswer+"\n"))
+		out, err := runSSHQuery([]string{"host", "true"})
+		if err != nil {
+			t.Fatalf("runSSHQuery() error = %v, want the query to succeed", err)
+		}
+		// 上限就是relay日志的上限; 只有那条说输出被丢弃的通知允许越过它.
+		if len(out) > maxRelayLogBytes+64 {
+			t.Errorf("runSSHQuery() kept %d bytes of stdout, want at most the %d-byte bound", len(out), maxRelayLogBytes)
+		}
+	})
+
+	t.Run("stderr", func(t *testing.T) {
+		// 失败且长篇解释自己的命令: 用户看到的解释同样有界.
+		t.Setenv("PATH", standInSSHPath(t, noisyAnswer+" >&2\nexit 1\n"))
+		_, err := runSSHQuery([]string{"host", "true"})
+		if err == nil {
+			t.Fatal("runSSHQuery() error = nil, want the failing exit status reported")
+		}
+		if len(err.Error()) > maxRelayLogBytes+64 {
+			t.Errorf("the error carries %d bytes of ssh's stderr, want at most the %d-byte bound", len(err.Error()), maxRelayLogBytes)
+		}
+	})
+}
+
+func TestRunSSHQueryTruncationNeverReportsAFreePath(t *testing.T) {
+	// 主机先报路径被占用再猛刷, 被丢掉的恰好是结论那部分. 剩下的
+	// 是没结论, 必须拒绝; 若让其余输出冒充答案, 就会在已占用的路径上开会话.
+	requireStandInSSH(t)
+	t.Setenv("PATH", standInSSHPath(t, "echo "+socketLiveMarker+"\n"+noisyAnswer+"\n"))
+
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", runSSHCommand)
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the verdict was dropped")
+	}
+	if state == socketFree || state == socketReclaimed {
+		t.Errorf("state = %v, want a verdict that does not start a session", state)
+	}
+}
+
+func TestCheckRemoteSocketFreeGivesUpOnAHostThatNeverAnswers(t *testing.T) {
+	// 一次性查询有自己的截止时间: 等到主机答话或超时, 先到为准. 没有它时预检查会在
+	// 不应答的主机上一挂不起; 预检查又跑在任何信号处理安装之前, 连中断都做不到.
+	requireStandInSSH(t)
+	t.Setenv("PATH", standInSSHPath(t, "sleep 30\n"))
+
+	start := time.Now()
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", runSSHCommand)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the host never answered")
+	}
+	if state == socketFree || state == socketReclaimed {
+		t.Errorf("state = %v, want a verdict that does not start a session", state)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error %v should name the deadline it ran out of", err)
+	}
+	if elapsed < sshQueryTimeout {
+		t.Errorf("the call returned after %v, before the %v deadline", elapsed, sshQueryTimeout)
+	}
+	if elapsed > sshQueryTimeout+10*time.Second {
+		t.Errorf("the call took %v with a %v deadline, so the wait on a host that never answers is unbounded", elapsed, sshQueryTimeout)
+	}
 }

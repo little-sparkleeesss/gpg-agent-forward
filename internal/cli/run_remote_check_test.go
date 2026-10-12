@@ -35,7 +35,7 @@ func TestRunSSHRefusesAHostItCannotCheck(t *testing.T) {
 		t.Skip("the stand-in ssh is a shell script")
 	}
 	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHSaying(t, "", "exit 0", "exit 0")
+	fake := newStandInSSHSaying(t, "", "exit 0")
 
 	err, _ := runSSHAgainstStandIn(t, port)
 
@@ -52,19 +52,18 @@ func TestRunSSHRefusesAHostItCannotCheck(t *testing.T) {
 
 func TestRunSSHStartsWithTheFlagWhenTheHostCannotBeChecked(t *testing.T) {
 	// `--skip-remote-check`是主机查不了时的显式通道: session照开, 并明确说出没做检查.
-	// 末尾的cleanup连接同样未检查且保持安静, 它不删除自己无法担保的东西.
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in ssh is a shell script")
 	}
 	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHSaying(t, "", "exit 0", "exit 0")
+	fake := newStandInSSHSaying(t, "", "exit 0")
 
 	err, errOut := runSSHAgainstStandIn(t, port, "--skip-remote-check")
 
 	if err != nil {
 		t.Fatalf("Run(ssh) error = %v, want the session to run with the flag given; diagnostics: %q", err, errOut)
 	}
-	if want := []string{"probe", "session", "probe"}; !slices.Equal(fake.invocations(t), want) {
+	if want := []string{"probe", "session"}; !slices.Equal(fake.invocations(t), want) {
 		t.Errorf("ssh invocations = %q, want %q", fake.invocations(t), want)
 	}
 	if !strings.Contains(errOut, "--skip-remote-check") {

@@ -176,21 +176,6 @@ func TestCheckRemoteSocketFreeSurfacesRunnerFailure(t *testing.T) {
 	}
 }
 
-func TestRemoveRemoteSocketAfterSessionLeavesInUsePathsAlone(t *testing.T) {
-	// 退出时占着路径的活socket已属于当下使用者, 而不是刚结束的会话: 清理必须原样放过,
-	// 不是no-op就会破坏接管该路径的人.
-	if err := RemoveRemoteSocketAfterSession([]string{"host"}, "/p", runReporting(socketLiveMarker)); err != nil {
-		t.Errorf("RemoveRemoteSocketAfterSession() error = %v, want nil for a path someone is using", err)
-	}
-}
-
-func TestRemoveRemoteSocketAfterSessionReportsATransportFailure(t *testing.T) {
-	run := func([]string, string) (string, error) { return "", errors.New("ssh: connection failed") }
-	if err := RemoveRemoteSocketAfterSession([]string{"host"}, "/p", run); err == nil {
-		t.Error("RemoveRemoteSocketAfterSession() error = nil, want the ssh failure returned for the caller to report")
-	}
-}
-
 func TestShellQuoteSingleEscapesQuotes(t *testing.T) {
 	// `ValidateRemoteSocket`不拒绝单引号, 含单引号的路径必须作为单个字面词传入,
 	// 否则会提前闭合引号并把后面的内容当命令跑; 转义用标准的闭合-转义-重开形式.
