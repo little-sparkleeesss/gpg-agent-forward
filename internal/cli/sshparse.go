@@ -248,12 +248,12 @@ func octalEscapes(s string) string {
 	return b.String()
 }
 
-// 远端socket预检只问: sshd将要绑定的路径上有没有东西在监听; 判成"没有"判错就是在删在用的socket.
-// 证据是远端主机自己对路径的连接, 不是读socket表: 表只描述一个网络命名空间, 别的命名空间里的
-// 监听者两边都不出现, 会被当成残留删掉.
-// 三步只有第三步可能删除: 1) 路径上是什么 (只用shell内建), 不可写或不是socket就拒绝, 可写的
-// socket进2). 2) 阳性对照: 让主机连自建socket, 否则`AllowStreamLocalForwarding`/`PermitOpen`的
-// 拒绝与没人监听不可分; 3) 连接保持=监听者, 立刻结束才删; 判不了即拒绝, --skip-remote-check是出口.
+// 远端socket预检问一件事: sshd将要绑定的路径上有没有东西在监听; 判成"没有"判错会删掉在用的socket.
+// 证据是主机自己对路径发起的连接, 不是读socket表: 表只描述一个网络命名空间, 别的命名空间里的
+// 监听者 (如共享目录的容器agent) 两边都不出现, 会被当成残留删掉.
+// 三步只有第三步可能删除: 1) 问路径上是什么 (只用shell内建), 不可写就拒绝: 写权限是连接socket
+// 说得出话的前提, 没有它"被拒的连接"与"没人监听"就是同一个答案; 2) 阳性对照: 让主机连自建socket,
+// 不然stream-local转发的拒绝与没人监听无异; 3) 连接保持=监听者, 立刻结束才尝试删除; 判不了即拒绝.
 const (
 	// socketAbsentMarker: 路径上什么都没有; 标记都按整行匹配, 登录横幅里的普通词不算判定.
 	socketAbsentMarker = "gpg-agent-forward-socket-absent"
@@ -272,10 +272,10 @@ const (
 
 // remoteSocketForm: 一条远端命令, 只用shell自己的测试报告path上是什么.
 // 用内建测试而不依赖程序: 没有stat, ls, grep的主机答得一样好, 而这个答案决定删不删.
-// 答案的含义: 不存在是健康情况 (指向不存在目标的符号链接同理, 会话的bind会替掉链接); 不可写
-// 就拒绝, 因为连接socket要它的写权限, 而拒绝连接与"没人监听"从本地端看一样, 只能正面测.
+// 答案的含义: 不存在是健康情况 (指向不存在目标的符号链接同理, 会话的bind会替掉链接); 不可写,
+// 非socket都拒绝且不动; 可写的socket才交给连接去分类.
 // 路径在脚本里解码, 不上命令行: 远端登录shell先解析, csh/tcsh连单引号内也做历史展开,
-// 详见 octalEscapes; 也让ssh对-L/-R的百分号展开无事可做, 详见 `percentEscape`.
+// 详见 octalEscapes; 也让ssh对-L/-R的百分号展开无事可做 (详见 `percentEscape`); 解码先证明再信任.
 func remoteSocketForm(path string) string {
 	script := strings.Join([]string{
 		`[ "$(printf '\134')" = '\' ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
@@ -348,7 +348,37 @@ const (
 	socketNotASocket                           // 挡路的是非socket文件
 	socketStuck                                // 遗留socket还在, 删不掉
 	socketUnjudgeable                          // 主机问不到, 或没有回答
+	socketUnwritable                           // 有东西在, 本用户不可写
 )
+
+// String: 让失败信息读作`socketUnjudgeable`而不是`state 5`.
+func (s remoteSocketState) String() string {
+	switch s {
+	case socketFree:
+		return "socketFree"
+	case socketReclaimed:
+		return "socketReclaimed"
+	case socketLive:
+		return "socketLive"
+	case socketNotASocket:
+		return "socketNotASocket"
+	case socketStuck:
+		return "socketStuck"
+	case socketUnjudgeable:
+		return "socketUnjudgeable"
+	case socketUnwritable:
+		return "socketUnwritable"
+	}
+	return fmt.Sprintf("remoteSocketState(%d)", s)
+}
+
+// maySkipRemoteCheck: `--skip-remote-check`能否从这个状态起会话.
+// 规则看状态是怎么来的, 不看是哪个状态: 只覆盖"检查根本做不成" (主机问不到, 或没有回答),
+// 路径自身给出的判定不由该flag推翻: 有监听者, 非socket文件, 删不掉的残留都是;
+// 不可写是另一种出路的问题 (换个路径), 因为写权限正是连接socket这个判定成立的前提.
+func (s remoteSocketState) maySkipRemoteCheck() bool {
+	return s == socketUnjudgeable
+}
 
 // probeRemoteSocketForm: 问远端remoteSocket处有什么; 只有错误为nil时状态才有意义.
 func probeRemoteSocketForm(sshArgs []string, remoteSocket string, run SSHCommandRunner) (socketForm, error) {
@@ -648,28 +678,29 @@ func removeRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRun
 }
 
 // 让sshd即将绑定的远端路径可用,不可用则说明原因.
-// 活socket属于远端自己的gpg-agent:转发时sshd的`StreamLocalBindUnlink`会顶掉它占位,
-// gpg便静默连上别的agent,故拒绝覆盖;无人监听的遗留只在正向控制确认无人应答后才删除,
-// 使用中的socket,写不了的路径,连不上的主机都拒绝而非猜.
-// 仅error为nil才放行;`socketUnjudgeable`带`--skip-remote-check`,
-// `socketLive`,`socketNotASocket`,`socketStuck`是明确判定,不带该开关,都该停下.
+// 该路径是gpg找agent的地方:转发到它时,sshd的`StreamLocalBindUnlink`会顶掉那里的活socket占位,
+// gpg便静默连到别的agent,故活socket不覆盖;无人监听的遗留经正向控制确认无人应答后才删.
+// 仅error为nil才放行:`socketReclaimed`是已删遗留,`socketUnjudgeable`与`socketUnwritable`亦拒绝;
+// 哪些状态可被`--skip-remote-check`放行的规则详见`maySkipRemoteCheck`.
 func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommandRunner) (remoteSocketState, error) {
 	form, err := probeRemoteSocketForm(sshArgs, remoteSocket, run)
 	if err != nil {
-		return socketUnjudgeable, fmt.Errorf("checking what is at %s on the remote host: %w", remoteSocket, err)
+		return socketUnjudgeable, fmt.Errorf("could not check what is at %s on the remote host: %w", remoteSocket, err)
 	}
 	switch form {
 	case formAbsent:
 		return socketFree, nil
 	case formUnwritable:
-		return socketUnjudgeable, fmt.Errorf(
+		return socketUnwritable, fmt.Errorf(
 			"%s on the remote host cannot be written by your user there, so whether anything is listening on it cannot be told from here.\n"+
-				"  Connecting to a socket needs write permission on it, and a refusal reaches this side as a connection that\n"+
-				"  ended - the same thing a socket nothing is listening on looks like. A user-run removal would fail on it too,\n"+
-				"  so this tool does not try: removing a file it cannot write is not something it should do on your behalf.\n"+
-				"  Look at the file there (ls -l), or pass --remote-socket PATH to use a different path,\n"+
-				"  or pass --skip-remote-check to start without the check and accept that sshd may bind over a live agent socket.",
-			remoteSocket)
+				"  Connecting to a socket needs write permission on it, and a refused connect reaches this side as a\n"+
+				"  connection that ended - the same thing a socket nothing is listening on looks like. Without the\n"+
+				"  permission the two cannot be told apart, so this tool refuses rather than guess.\n"+
+				"  Do not delete it yourself to get past this: something may be listening on it, and protecting exactly\n"+
+				"  that is why this check exists. First see what is there and who owns it (ls -l %s), and make sure no\n"+
+				"  agent is using it.\n"+
+				"  Pass --remote-socket PATH to use a different path.",
+			remoteSocket, shellQuoteSingle(remoteSocket))
 	case formNotASocket:
 		return socketNotASocket, fmt.Errorf(
 			"%s exists on the remote host and is not a socket, so it is not a leftover agent socket.\n"+
@@ -697,9 +728,11 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommand
 		return socketUnjudgeable, fmt.Errorf(
 			"could not tell whether %s on the remote host is in use: %v.\n"+
 				"  The check works by having that host connect to the path, through a socket it creates next to it and then\n"+
-				"  removes; that connection is what could not be made. An sshd that refuses stream-local forwarding\n"+
-				"  (AllowStreamLocalForwarding no, PermitOpen limits, or a forward the host's own configuration clears)\n"+
-				"  refuses it, and a refusal is indistinguishable from a socket nothing is listening on, so nothing was removed.\n"+
+				"  removes; that connection is what could not be made. It needs stream-local forwarding in both directions - a\n"+
+				"  socket the host creates next to the path on that host, and a connect the host makes - so an sshd\n"+
+				"  that restricts it (AllowStreamLocalForwarding no, local or remote, or PermitOpen limits on the\n"+
+				"  connect) refuses one of them, and a refusal is indistinguishable from a socket nothing is listening\n"+
+				"  on, so nothing was removed.\n"+
 				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
 			remoteSocket, err)
 	}

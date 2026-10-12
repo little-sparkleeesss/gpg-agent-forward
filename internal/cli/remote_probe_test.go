@@ -366,14 +366,7 @@ func TestRemoteSocketFormReportsAnUnwritablePath(t *testing.T) {
 
 	run := localProbeRunner(os.Getenv("PATH"))
 	if os.Geteuid() == 0 {
-		unprivileged, err := runAsUnprivileged()
-		if err != nil {
-			t.Skipf("running as root and no unprivileged user to run the command as: %v", err)
-		}
-		run = unprivileged
-		if canWriteAs(run, path) {
-			t.Fatalf("the command can write %s, so this test cannot express an unwritable path", path)
-		}
+		run = runAsUnprivileged(t)
 	}
 	if canWriteAs(run, path) {
 		t.Fatalf("the command can write %s, so this test cannot express an unwritable path", path)
@@ -396,33 +389,31 @@ func TestRemoteSocketFormReportsAnUnwritablePath(t *testing.T) {
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a path this user cannot write")
 	}
-	if state != socketUnjudgeable {
-		t.Errorf("state = %v, want socketUnjudgeable", state)
+	if state != socketUnwritable {
+		t.Errorf("state = %v, want socketUnwritable", state)
 	}
 	if !socketFileExists(t, path) {
 		t.Fatal("a live socket in a path this user cannot write was removed")
 	}
 }
 
-// 测试进程是root时写权限会被绕过, 故以普通用户身份跑远端命令.
-func runAsUnprivileged() (SSHCommandRunner, error) {
+// 测试进程是root时写权限会被绕过, 故改用普通用户跑; 拿不到用户就直接失败.
+func runAsUnprivileged(t *testing.T) SSHCommandRunner {
+	t.Helper()
 	su, err := exec.LookPath("su")
 	if err != nil {
-		return nil, err
+		t.Fatalf("running as root and no su to drop privileges with: %v", err)
 	}
-	for _, user := range []string{"nobody", "daemon", "bin"} {
-		if err := exec.Command(su, "-s", "/bin/sh", user, "-c", "true").Run(); err != nil {
-			continue
-		}
-		u := user
-		return func(_ []string, remoteCommand string) (string, error) {
-			cmd := exec.Command(su, "-s", "/bin/sh", u, "-c", remoteCommand)
-			cmd.Env = envWithPath(os.Getenv("PATH"))
-			out, err := cmd.Output()
-			return string(out), err
-		}, nil
+	user, err := unprivilegedUser()
+	if err != nil {
+		t.Fatalf("running as root and no unprivileged user to run the command as: %v", err)
 	}
-	return nil, errors.New("no unprivileged user is reachable through su")
+	return func(_ []string, remoteCommand string) (string, error) {
+		cmd := exec.Command(su, "-s", "/bin/sh", user, "-c", remoteCommand)
+		cmd.Env = envWithPath(os.Getenv("PATH"))
+		out, err := cmd.Output()
+		return string(out), err
+	}
 }
 
 // 让测试确认自己真搭出了要考的条件.
@@ -739,6 +730,82 @@ func classifyWithForwardStandIn(t *testing.T, path string) (socketForwardVerdict
 	return classifyRemoteSocket([]string{"host"}, path, control)
 }
 
+// `forwardStandInSSH`的非特权版, 用于主题是权限而测试进程本会绕过的测试.
+// 权限是真的: root读写任何文件, mode-0的socket对它可写, 其连接说明不了
+// 普通用户会看到什么. 环境随`su`自己的命令行传递(su不传调用方环境).
+func forwardStandInSSHAsUnprivileged(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	if os.Geteuid() != 0 {
+		// 本来就是非特权: 调用方自己的用户就表达了这个条件.
+		forwardStandInSSH(t)
+		return ""
+	}
+	su, err := exec.LookPath("su")
+	if err != nil {
+		t.Fatalf("running as root and no su to drop privileges with: %v", err)
+	}
+	user, err := unprivilegedUser()
+	if err != nil {
+		t.Fatalf("running as root and no unprivileged user to run the check as: %v", err)
+	}
+
+	self := selfExe()
+	// 放在`/tmp`而不是`t.TempDir`: 后者是0700且归测试进程所有, 非特权用户
+	// 既读不出其中的参数, 也不能从那里运行helper.
+	dir, err := os.MkdirTemp("/tmp", "gpg-agent-forward-unprivileged-")
+	if err != nil {
+		t.Fatalf("make the stand-in's directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod the stand-in's directory: %v", err)
+	}
+	// 测试二进制也得跟着走: 正在跑的那个在0700的构建目录里, 非特权用户到不了.
+	helper := filepath.Join(dir, "helper")
+	if err := copyFile(self, helper); err != nil {
+		t.Fatalf("copy the test binary to a place the unprivileged user can run it from: %v", err)
+	}
+	argsFile := filepath.Join(dir, "args")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" > " + shellQuoteSingle(argsFile) + "\n" +
+		"exec " + shellQuoteSingle(su) + " -s /bin/sh " + user + " -c " +
+		shellQuoteSingle(forwardHelperEnv+"=1 "+forwardArgsEnv+"="+argsFile+" exec "+helper+
+			" -test.run=^TestForwardSSHHelper$") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write the unprivileged stand-in ssh: %v", err)
+	}
+	t.Setenv(forwardHelperEnv, "1")
+	t.Setenv(forwardArgsEnv, argsFile)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return user
+}
+
+// 以别的用户能运行helper所需的权限把`src`拷到`dst`.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o755)
+}
+
+// 返回一个本进程能以其身份运行命令的用户.
+func unprivilegedUser() (string, error) {
+	su, err := exec.LookPath("su")
+	if err != nil {
+		return "", err
+	}
+	for _, user := range []string{"nobody", "daemon", "bin"} {
+		if err := exec.Command(su, "-s", "/bin/sh", user, "-c", "true").Run(); err == nil {
+			return user, nil
+		}
+	}
+	return "", errors.New("no unprivileged user is reachable through su")
+}
+
 // 绝不能走到删除的一例: 接受连接却什么都不说的监听者.
 func TestClassifyRemoteSocketSeesALiveListener(t *testing.T) {
 	requireShell(t)
@@ -798,9 +865,9 @@ func TestClassifyRemoteSocketSeesNoListenerBehindWhatIsNotASocket(t *testing.T) 
 	}
 }
 
-// 这个对照存在的原因: `sshd`会拒绝stream-local转发(逐连接可配,
-// 用`AllowStreamLocalForwarding no`或`PermitOpen`限制), 对活socket的拒绝在本端与无人监听无从区分;
-// 没有对照就会授权删掉在用的socket, 有对照则答"无法判断", 什么都不删.
+// 这个对照所针对的发现: 没有它, 活socket与无人监听的socket在本端是同一答案(结束的连接),
+// 该答案会授权删掉在用的socket; 对照缺失则什么都不删. 替身`ssh`不驱动任何`sshd`选项,
+// 覆盖的是路由不是真实`sshd`行为: 真机夺走对照的方式写在检查本体的文档里.
 func TestClassifyRemoteSocketRefusesWhenTheControlIsMissing(t *testing.T) {
 	requireShell(t)
 	path := filepath.Join(shortTempDir(t), "S.gpg-agent")
@@ -1163,20 +1230,33 @@ func TestFreeLoopbackPortIsBindableAndNotZero(t *testing.T) {
 	}
 }
 
-func TestStrtosItoaIsUsedForPorts(t *testing.T) {
-	// forward规格用`strconv`而非格式串拼: 端口不会渲染成`ssh`读不出的拼写.
+// 钉住三条规格的精确拼写(含端口): `ssh`按地址加端口解析, 端口写成别的样子
+// (格式化产物, 浮点, 空串)会让`ssh`直接拒绝该规格, 或绑到检查没等的端口上;
+// 断言是整条规格的相等: 分隔符, 地址或端口渲染一变就失败在此而非下游.
+func TestSSHForwardArgsRenderPortsAsDecimal(t *testing.T) {
 	args, err := sshForwardArgs([]string{"host"}, socketForwardSpec{
-		controlPort: 1, controlPath: "/tmp/c", targetPort: 2, targetPath: "/tmp/t", holdPort: 3,
+		controlPort: 40001, controlPath: "/tmp/c", targetPort: 40002, targetPath: "/tmp/t", holdPort: 40003,
 	})
 	if err != nil {
 		t.Fatalf("sshForwardArgs() error = %v", err)
 	}
 	got := strings.Join(args, " ")
-	if !strings.Contains(got, "-L 127.0.0.1:1:/tmp/c") || !strings.Contains(got, "-R /tmp/c:127.0.0.1:3") {
-		t.Errorf("sshForwardArgs() = %q", got)
+	want := []string{
+		"-R /tmp/c:127.0.0.1:40003",
+		"-L 127.0.0.1:40001:/tmp/c",
+		"-L 127.0.0.1:40002:/tmp/t",
 	}
-	if strings.Contains(got, "%!") {
-		t.Errorf("sshForwardArgs() = %q, which carries a formatting artefact", got)
+	for _, spec := range want {
+		if n := strings.Count(got, spec); n != 1 {
+			t.Errorf("sshForwardArgs() = %q, want exactly one %q, got %d", got, spec, n)
+		}
 	}
-	_ = strconv.Itoa
+	// 顺序也是契约的一部分: 端口按检查等待的顺序发布, 目的地放最后,
+	// 让`ssh`把它读成目的地而不是某个forward的值.
+	if iR, iL := strings.Index(got, want[0]), strings.Index(got, want[1]); !(0 <= iR && iR < iL) {
+		t.Errorf("sshForwardArgs() = %q, want the -R before the first -L", got)
+	}
+	if !strings.HasSuffix(got, " host") {
+		t.Errorf("sshForwardArgs() = %q, want the destination last", got)
+	}
 }

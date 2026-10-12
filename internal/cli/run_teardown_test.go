@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,19 +85,40 @@ func startAdoptedRelay(t *testing.T) (port int, addr string, stop func()) {
 	return port, fmt.Sprintf("127.0.0.1:%d", port), stop
 }
 
-// `extra`里的gpg-agent-forward选项放在目标主机之前; 返回`Run`的error和写到诊断输出的内容.
-func runSSHAgainstStandIn(t *testing.T, port int, extra ...string) (error, string) {
+// 替身ssh在discovery查询里回的正是run测试在`--remote-socket`里给的那个路径,
+// 免得agent socket在哪出现两种写法.
+const standInRemoteSocketPath = "/run/user/1000/gnupg/S.gpg-agent"
+
+// 给定的gpg-agent-forward选项放在目标主机之前; 诊断写到`errOut`, 返回`Run`的error.
+func runSSHCommandLine(t *testing.T, port int, errOut io.Writer, own ...string) error {
 	t.Helper()
-	var out, errOut bytes.Buffer
+	var out bytes.Buffer
 	args := []string{
 		"ssh",
 		"--port", fmt.Sprint(port),
 		"--socket-file", "/tmp/sock",
-		"--remote-socket", "/run/user/1000/gnupg/S.gpg-agent",
 	}
-	args = append(args, extra...)
+	args = append(args, own...)
 	args = append(args, "dev@host")
-	err := Run(args, &out, &errOut)
+	return Run(args, &out, errOut)
+}
+
+// 跑ssh子命令时给定远端socket(除discovery用例外, 各测试都这样到检查);
+// `extra`是额外的gpg-agent-forward选项; 返回`Run`的error与诊断输出.
+func runSSHAgainstStandIn(t *testing.T, port int, extra ...string) (error, string) {
+	t.Helper()
+	var errOut bytes.Buffer
+	own := append([]string{"--remote-socket", standInRemoteSocketPath}, extra...)
+	err := runSSHCommandLine(t, port, &errOut, own...)
+	return err, errOut.String()
+}
+
+// `runSSHAgainstStandIn`不传`--remote-socket`的版本:
+// run要问替身agent socket在哪, 这就是discovery连接.
+func runSSHDiscoveringAgainstStandIn(t *testing.T, port int, extra ...string) (error, string) {
+	t.Helper()
+	var errOut bytes.Buffer
+	err := runSSHCommandLine(t, port, &errOut, extra...)
 	return err, errOut.String()
 }
 

@@ -32,9 +32,15 @@ func TestSplitSSHArgsKeepsTheDestinationAfterASwitch(t *testing.T) {
 	}
 }
 
-// 替身ssh对run的每种调用分别作答, 结果可按调用内容区分:
-// 带`socketAbsentMarker`的form命令回`formMarker`; 带rm的删除分两条 - control socket
-// 那条回`socketReclaimedMarker`, 被测路径那条回`removalMarker`; 其余是session.
+// 替身ssh的discovery分支等的标记文件, 由测试在通报时创建:
+// 先通报连接再提问才过得去, 先问后通报的到不了session.
+func discoveryAnnouncedMarker(f *standInSSH) string {
+	return f.log + ".discovery-announced"
+}
+
+// 替身ssh对run的四种调用分别作答: 带`gpgconf`的discovery查询只在run通报到`stderr`
+// 之后才回`standInRemoteSocketPath`; 删除分两条: control socket回`socketReclaimedMarker`,
+// 被测路径回`removalMarker`; 带`socketAbsentMarker`的form命令回`formMarker`, 其余是session.
 func newStandInSSHForForm(t *testing.T, formMarker, removalMarker string) *standInSSH {
 	t.Helper()
 	dir := t.TempDir()
@@ -52,6 +58,13 @@ func newStandInSSHForForm(t *testing.T, formMarker, removalMarker string) *stand
 	}
 	script := fmt.Sprintf(`#!/bin/sh
 case "$*" in
+  *gpgconf*)
+    echo query >> %s
+    i=0
+    while [ ! -e %s ] && [ "$i" -lt 100 ]; do i=$((i+1)); sleep 0.05; done
+    [ -e %s ] || exit 1
+    echo %s
+    ;;
   *%s*)
     echo probe >> %s
     %s
@@ -75,6 +88,7 @@ case "$*" in
     ;;
 esac
 `,
+		shellQuoteSingle(f.log), shellQuoteSingle(discoveryAnnouncedMarker(f)), shellQuoteSingle(discoveryAnnouncedMarker(f)), standInRemoteSocketPath,
 		socketAbsentMarker, shellQuoteSingle(f.log), form,
 		casePatternFor(octalEscapes("/"+controlSocketPrefix)), shellQuoteSingle(f.log), socketReclaimedMarker,
 		shellQuoteSingle(f.log), removal,
@@ -90,12 +104,27 @@ esac
 // 分类是唯一需要真ssh连接的部分, 详见`remote_probe_test.go`.
 func withFormAndClassification(t *testing.T, verdict socketForwardVerdict, err error) {
 	t.Helper()
+	withFormAndClassificationCalling(t, verdict, err, nil)
+}
+
+// 在`withFormAndClassification`上加一个分类被调用时触发的hook,
+// 用来判断那时诊断里已经写了什么.
+func withFormAndClassificationCalling(t *testing.T, verdict socketForwardVerdict, err error, onCall func()) {
+	t.Helper()
 	old := classifyRemoteSocketForward
 	classifyRemoteSocketForward = func([]string, string, string) (socketForwardVerdict, error) {
+		if onCall != nil {
+			onCall()
+		}
 		return verdict, err
 	}
 	t.Cleanup(func() { classifyRemoteSocketForward = old })
 }
+
+// 由函数充当`io.Writer`, 供逐段观察诊断输出的测试使用.
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 // 把`s`转义后用作shell case pattern: 远端命令里带的是八进制转义,
 // 不转义的话每个反斜杠会被pattern当成引用符.
@@ -150,6 +179,12 @@ func TestRunSSHStartsWithTheFlagWhenTheHostCannotBeChecked(t *testing.T) {
 	if !strings.Contains(errOut, "--skip-remote-check") {
 		t.Errorf("diagnostics = %q, want the skipped check reported", errOut)
 	}
+	if !strings.Contains(errOut, "starting without a verdict") {
+		t.Errorf("diagnostics = %q, want the skip reported as a missing verdict", errOut)
+	}
+	if !strings.Contains(errOut, "the host did not answer") {
+		t.Errorf("diagnostics = %q, want the reason the check could not be made", errOut)
+	}
 }
 
 func TestRunSSHRefusesALiveSocketWhateverTheFlagSays(t *testing.T) {
@@ -195,6 +230,56 @@ func TestRunSSHStartsAfterReclaimingALeftover(t *testing.T) {
 	}
 }
 
+// 无`--remote-socket`的run会多开两条连接, 这是第一条: 在检查之前先问远端
+// agent socket在哪. 它和pre-check一样可能在终端上提示, 所以同样要先通报;
+// 替身的查询分支只在通报行写出后才作答, 先问后通报的到不了session.
+func TestRunSSHAnnouncesTheDiscoveryConnectionBeforeItRuns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSHForForm(t, socketSocketMarker, socketReclaimedMarker)
+	withFormAndClassification(t, forwardDead, nil)
+
+	var diagnostics bytes.Buffer
+	announced := false
+	w := writerFunc(func(p []byte) (int, error) {
+		if !announced && strings.Contains(string(p), "asking the remote host where its agent socket is") {
+			announced = true
+			if err := os.WriteFile(discoveryAnnouncedMarker(fake), nil, 0o600); err != nil {
+				t.Errorf("mark the announced discovery connection: %v", err)
+			}
+		}
+		return diagnostics.Write(p)
+	})
+	err := runSSHCommandLine(t, port, w)
+
+	if err != nil {
+		t.Fatalf("Run(ssh) error = %v, want the session to run; diagnostics: %q", err, diagnostics.String())
+	}
+	want := []string{"query", "probe", "remove", "session"}
+	if got := checkInvocations(t, fake); !slices.Equal(got, want) {
+		t.Errorf("ssh invocations = %q, want %q", got, want)
+	}
+	if !announced {
+		t.Errorf("diagnostics = %q, want the discovery connection announced", diagnostics.String())
+	}
+	checked := strings.Index(diagnostics.String(), "checking what is at "+standInRemoteSocketPath)
+	if checked < 0 {
+		t.Fatalf("diagnostics = %q, want the check announced by path", diagnostics.String())
+	}
+	if named := strings.Index(diagnostics.String(), "asking the remote host where its agent socket is"); named < 0 || named > checked {
+		t.Errorf("diagnostics = %q, want the discovery connection named before the check", diagnostics.String())
+	}
+
+	// 这行与查询结果无关: 这里查询失败, 要的就是先于查询写出.
+	requireStandInSSH(t)
+	t.Setenv("PATH", standInSSHPath(t, "exit 1\n"))
+	if _, failedOut := runSSHDiscoveringAgainstStandIn(t, port); !strings.Contains(failedOut, "asking the remote host where its agent socket is") {
+		t.Errorf("diagnostics = %q, want the discovery connection named even when the query fails", failedOut)
+	}
+}
+
 // 删除本身的结果才是最后答案: 目录不可写时connect也会被拒,
 // 所以没有应答不构成启动的许可.
 func TestRunSSHStopsWhenTheLeftoverCannotBeRemoved(t *testing.T) {
@@ -216,20 +301,37 @@ func TestRunSSHStopsWhenTheLeftoverCannotBeRemoved(t *testing.T) {
 	}
 }
 
-// `Run`层的fail-closed核心: 拒绝stream-local forwarding的`sshd`会让活socket看着也像死的,
-// 所以分不出类时必须停在原地, 不能开session.
+// `Run`层的fail-closed核心: 拒绝stream-local forwarding的`sshd`会让活socket也像死的,
+// 分不出类时只能停下. 这里还固定检查的上下文行必须先写出:
+// 检查期间ssh的提示(host-key确认, passphrase)走`/dev/tty`, 这行是用户判断谁在问的线索.
 func TestRunSSHStopsWhenTheClassificationCannotBeMade(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in ssh is a shell script")
 	}
 	port, _, _ := startAdoptedRelay(t)
 	fake := newStandInSSHForForm(t, socketSocketMarker, socketReclaimedMarker)
-	withFormAndClassification(t, forwardUnjudgeable, fmt.Errorf("the control connection was not established"))
+	var classified bool
+	withFormAndClassificationCalling(t, forwardUnjudgeable, fmt.Errorf("the control connection was not established"),
+		func() { classified = true })
 
-	err, _ := runSSHAgainstStandIn(t, port)
+	// writer逐段看诊断输出: 通报必须在分类还没被问到时到达.
+	var diagnostics bytes.Buffer
+	announcedBeforeTheCheck := false
+	err := runSSHCommandLine(t, port, writerFunc(func(p []byte) (int, error) {
+		if !classified && strings.Contains(string(p), "checking what is at") {
+			announcedBeforeTheCheck = true
+		}
+		return diagnostics.Write(p)
+	}), "--remote-socket", standInRemoteSocketPath)
 
 	if err == nil {
 		t.Fatal("Run(ssh) error = nil, want a refusal when the check cannot tell")
+	}
+	if !strings.Contains(diagnostics.String(), "checking what is at "+standInRemoteSocketPath) {
+		t.Errorf("diagnostics = %q, want the check announced by path", diagnostics.String())
+	}
+	if !announcedBeforeTheCheck {
+		t.Error("the check was announced only after it had run, so the line cannot tell the user who is asking while ssh prompts")
 	}
 	if !strings.Contains(err.Error(), "--skip-remote-check") {
 		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
@@ -238,6 +340,7 @@ func TestRunSSHStopsWhenTheClassificationCannotBeMade(t *testing.T) {
 		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
 	}
 
+	// 带flag时session照开, 报告检查被跳过, 并把检查没能定下的原因打印出来而不是吞掉.
 	port2, _, _ := startAdoptedRelay(t)
 	fake2 := newStandInSSHForForm(t, socketSocketMarker, socketReclaimedMarker)
 	withFormAndClassification(t, forwardUnjudgeable, fmt.Errorf("the control connection was not established"))
@@ -248,14 +351,17 @@ func TestRunSSHStopsWhenTheClassificationCannotBeMade(t *testing.T) {
 	if want := []string{"probe", "session"}; !slices.Equal(checkInvocations(t, fake2), want) {
 		t.Errorf("ssh invocations = %q, want %q", checkInvocations(t, fake2), want)
 	}
-	if !strings.Contains(errOut, "--skip-remote-check") {
-		t.Errorf("diagnostics = %q, want the skipped check reported", errOut)
+	if !strings.Contains(errOut, "--skip-remote-check") || !strings.Contains(errOut, "starting without a verdict") {
+		t.Errorf("diagnostics = %q, want the skipped check reported as a missing verdict", errOut)
+	}
+	if !strings.Contains(errOut, "the control connection was not established") {
+		t.Errorf("diagnostics = %q, want the reason the check could not be made", errOut)
 	}
 }
 
 // 权限关口: 连socket需要写权限, 权限被拒与无人监听在连接层同样是关闭, 无从区分,
-// 所以先在远端正面测权限, 默认是拒绝而不是删除. `--skip-remote-check`确实能放行这里,
-// 这是刻意的: 路径判不了正是该开关的用途; 代价是`sshd`的bind可能unlink别人的socket.
+// 所以先在远端正面测权限, 默认是拒绝而不是删除. 这里的拒绝只提`--remote-socket`,
+// 不提`--skip-remote-check`: 该开关只覆盖没能查, 而这是已发现一个查不了的东西, 出路是换路径.
 func TestRunSSHStopsAtAPathItCannotWrite(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in ssh is a shell script")
@@ -271,11 +377,27 @@ func TestRunSSHStopsAtAPathItCannotWrite(t *testing.T) {
 	if !strings.Contains(err.Error(), "cannot be written") {
 		t.Errorf("error %v should say the path cannot be written", err)
 	}
-	if !strings.Contains(err.Error(), "--skip-remote-check") {
-		t.Errorf("error %v should name --skip-remote-check as the deliberate way to start anyway", err)
+	if !strings.Contains(err.Error(), "--remote-socket") {
+		t.Errorf("error %v should name --remote-socket, the way that actually works here", err)
+	}
+	if strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error for an unwritable path offers --skip-remote-check, which cannot help here: %v", err)
 	}
 	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake), want) {
 		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
+	}
+
+	// 这个flag到这里就到头了: 给了它, run对同一状态照样拒绝, session不开.
+	fake2 := newStandInSSHForForm(t, socketUnwritableMarker, "")
+	err2, _ := runSSHAgainstStandIn(t, port, "--skip-remote-check")
+	if err2 == nil {
+		t.Fatal("Run(ssh) error = nil, want the refusal to stand with --skip-remote-check given")
+	}
+	if !strings.Contains(err2.Error(), "cannot be written") {
+		t.Errorf("error %v should still say the path cannot be written", err2)
+	}
+	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake2), want) {
+		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake2), want)
 	}
 }
 

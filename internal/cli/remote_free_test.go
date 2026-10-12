@@ -124,8 +124,9 @@ func TestCheckRemoteSocketFreeRefusesAFileThatIsNotASocket(t *testing.T) {
 	}
 }
 
-// 覆盖让"无权限"情形安全的那道闸门: 连接socket需要它的写权限, 权限拒绝到达本端时表现为
-// 连接被关闭, 与无人监听的socket一模一样; 所以先在主机上正面测权限, 再信任任何连接.
+// 覆盖让"无权限"情形安全的闸门: 连接socket要它的写权限, 被拒的连接与无人监听在这端
+// 分不开, 所以先在主机上正面测权限; 本状态给不出`--skip-remote-check`, 报错改给行得通的
+// 路`--remote-socket`, 外加别手动删路径的警告: 可能有监听者.
 func TestCheckRemoteSocketFreeRefusesAPathItCannotWrite(t *testing.T) {
 	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runForm(socketUnwritableMarker))
 	if err == nil {
@@ -134,13 +135,27 @@ func TestCheckRemoteSocketFreeRefusesAPathItCannotWrite(t *testing.T) {
 	if !strings.Contains(err.Error(), "cannot be written") {
 		t.Errorf("error %v should say the path cannot be written", err)
 	}
-	if !strings.Contains(err.Error(), "--skip-remote-check") {
-		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
+	if !strings.Contains(err.Error(), "--remote-socket") {
+		t.Errorf("error %v should name --remote-socket, the way that actually works here", err)
+	}
+	// 开关只在起作用的地方出现: 本状态带不带开关都被拒, 写进报错只会把用户引上走不通的路.
+	if strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error for an unwritable path offers --skip-remote-check, which cannot help here: %v", err)
+	}
+	// 警告必须说正面理由: 路径上可能有监听者, 手动删除会失去那个agent或把它的socket让给别人.
+	// 报错不能改说"删除会失败"(表单测socket的`-w`, 删除要目录的写权限, 两者会不一致),
+	// 也不能给出自己的删除命令.
+	if !strings.Contains(err.Error(), "Do not delete it yourself") {
+		t.Errorf("error for an unwritable path should tell the user not to delete the path by hand: %v", err)
+	}
+	if strings.Contains(err.Error(), "rm -f") {
+		t.Errorf("error for an unwritable path suggests deleting the path by hand: %v", err)
 	}
 }
 
-// 覆盖由删除结果本身决定结论: 目录不可写或路径本身是目录时连接也会被拒,
-// 所以"没人应答"本身证明不了文件是遗留.
+// 覆盖由删除自身结果决定结论: 连接测的是socket本身的写权限, 删除要的是它所在目录的写权限,
+// 所以连接的"没人应答"证明不了文件删得掉; 删除结果才是最后判据,
+// 本测试直接驱动该结果, 不经过真实主机.
 func TestCheckRemoteSocketFreeRefusesAStuckSocket(t *testing.T) {
 	withClassification(t, forwardDead, nil)
 	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent",
@@ -219,6 +234,73 @@ func TestCheckRemoteSocketFreeSurfacesRunnerFailure(t *testing.T) {
 	run := func([]string, string) (string, error) { return "", errors.New("ssh: connection failed") }
 	if _, err := CheckRemoteSocketFree([]string{"host"}, "/p", run); err == nil {
 		t.Error("CheckRemoteSocketFree() error = nil, want the ssh failure surfaced")
+	}
+}
+
+// 钉住每条拒绝的用户可见文本: 每个把`remoteSocket`或ssh失败折进模板的分支都至少渲染一次,
+// 防漏跑与格式化疏漏. `%!`抓`fmt.Errorf`坏调用的残留(`go vet`的`printf`检查也报);
+// `%s`/`%v`/`%w`抓`go vet`看不到的: 文本不再走格式化, 如`errors.New`里遗留的百分号动词.
+func TestCheckRemoteSocketFreeMessagesHaveNoFormatLeftovers(t *testing.T) {
+	path := "/run/user/1000/gnupg/S.gpg-agent"
+	// 目录里放不下控制socket名字(107字节上限)的路径, 会被`controlSocketPath`拒绝.
+	noRoom := "/" + strings.Repeat("d", 82) + "/S.gpg-agent"
+
+	withClassification(t, forwardLive, nil)
+	liveState, liveErr := CheckRemoteSocketFree([]string{"host"}, path, runForm(socketSocketMarker))
+	unwritableState, unwritableErr := CheckRemoteSocketFree([]string{"host"}, path, runForm(socketUnwritableMarker))
+	notASocketState, notASocketErr := CheckRemoteSocketFree([]string{"host"}, path, runForm(socketNotASocketMarker))
+	unknownState, unknownErr := CheckRemoteSocketFree([]string{"host"}, path, runForm(socketUnknownMarker))
+	noRoomState, noRoomErr := CheckRemoteSocketFree([]string{"host"}, noRoom, runForm(socketSocketMarker))
+	probeErrRun := func([]string, string) (string, error) { return "", errors.New("ssh: connection failed") }
+	probeErrState, probeErr := CheckRemoteSocketFree([]string{"host"}, path, probeErrRun)
+
+	withClassification(t, forwardUnjudgeable, nil)
+	unjudgeableState, unjudgeableErr := CheckRemoteSocketFree([]string{"host"}, path, runForm(socketSocketMarker))
+
+	withClassification(t, forwardUnjudgeable, errors.New("the control connection was not established"))
+	classifyErrState, classifyErr := CheckRemoteSocketFree([]string{"host"}, path, runForm(socketSocketMarker))
+
+	// 两条卡死socket消息(删除报失败, runner失败删不成), 都把`remoteSocket`及其错误折进模板.
+	withClassification(t, forwardDead, nil)
+	stuckState, stuckErr := CheckRemoteSocketFree([]string{"host"}, path,
+		runFormThenRemoval(socketSocketMarker, socketStuckMarker))
+	removalErrRun := func(_ []string, remoteCommand string) (string, error) {
+		if strings.Contains(remoteCommand, "rm -f") {
+			return "", errors.New("ssh: connection failed")
+		}
+		return socketSocketMarker + "\n", nil
+	}
+	failedState, failedErr := CheckRemoteSocketFree([]string{"host"}, path, removalErrRun)
+
+	messages := []struct {
+		name  string
+		state remoteSocketState
+		err   error
+	}{
+		{"a live socket", liveState, liveErr},
+		{"an unwritable path", unwritableState, unwritableErr},
+		{"a file that is not a socket", notASocketState, notASocketErr},
+		{"a host that did not answer", unknownState, unknownErr},
+		{"a path with no room for the control socket", noRoomState, noRoomErr},
+		{"a probe whose ssh failed", probeErrState, probeErr},
+		{"no verdict and no error to report", unjudgeableState, unjudgeableErr},
+		{"no verdict with an error to report", classifyErrState, classifyErr},
+		{"a leftover that could not be removed", stuckState, stuckErr},
+		{"a removal whose ssh failed", failedState, failedErr},
+	}
+	// 一个用例报不出错只算它自己失败, 循环继续: 缺一条消息不能盖住其余用例.
+	for _, m := range messages {
+		if m.err == nil {
+			t.Errorf("%s (state %v) produced no error, so this case is not a message under test", m.name, m.state)
+			continue
+		}
+		text := m.err.Error()
+		if strings.Contains(text, "%!") {
+			t.Errorf("message for %s (state %v) has a formatting leftover: %q", m.name, m.state, text)
+		}
+		if strings.Contains(text, "%s") || strings.Contains(text, "%v") || strings.Contains(text, "%w") {
+			t.Errorf("message for %s (state %v) has an unexpanded verb: %q", m.name, m.state, text)
+		}
 	}
 }
 

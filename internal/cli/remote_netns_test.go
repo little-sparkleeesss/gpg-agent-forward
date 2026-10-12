@@ -171,27 +171,39 @@ func TestClassifyRemoteSocketFindsALeftover(t *testing.T) {
 
 // 权限判定之门: 连socket需要写权限, 被拒时调用方看到的连接结束与无人监听无法区分,
 // 所以form命令先在主机上正面试写权限; 本测试钉住的就是连接本身分不开这两者.
+// 权限必须真实生效, 连接要由它约束的用户发出, 详见`forwardStandInSSHAsUnprivileged`.
 func TestClassifyRemoteSocketFindsNoListenerBehindAnUnwritablePath(t *testing.T) {
 	requireShell(t)
-	if os.Geteuid() == 0 {
-		t.Skip("running as root, which bypasses the permission the test turns on")
+	// 路径各级须对连接用户可穿过而socket不可写, 所在目录须可写: 判定会在路径旁
+	// 创建control socket, `sshd`绑该路径也一样; `t.TempDir`的0700两者都不满足.
+	dir, err := os.MkdirTemp("/tmp", "gpg-agent-forward-unwritable-")
+	if err != nil {
+		t.Fatalf("make a directory to hold the socket: %v", err)
 	}
-	socket := filepath.Join(t.TempDir(), "S.gpg-agent")
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod the directory: %v", err)
+	}
+	socket := filepath.Join(dir, "S.gpg-agent")
 	l := liveSocketAt(t, socket)
 	defer l.Close()
 	if err := os.Chmod(socket, 0); err != nil {
-		t.Skipf("cannot chmod the socket: %v", err)
+		t.Fatalf("chmod the socket: %v", err)
 	}
 
-	verdict, err := classifyUnixSocketLocally(t, socket)
+	verdict, err := classifyUnixSocketLocallyAsUnprivileged(t, socket)
 	if err != nil {
-		t.Fatalf("classifyUnixSocketLocally(%s) error = %v", socket, err)
+		t.Fatalf("classification error = %v", err)
 	}
 	if verdict != forwardDead {
 		t.Fatalf("verdict = %v, want forwardDead: this is the ambiguity the form command's write test exists to catch", verdict)
 	}
-	// form命令在此兜住: 同一路径报不可写, 不会走到删除.
-	form, err := probeRemoteSocketForm([]string{"host"}, socket, localProbeRunner(os.Getenv("PATH")))
+	// form命令在此兜住: 以同一用户运行, 该路径报不可写, 不会走到删除.
+	formRun := localProbeRunner(os.Getenv("PATH"))
+	if os.Geteuid() == 0 {
+		formRun = runAsUnprivileged(t)
+	}
+	form, err := probeRemoteSocketForm([]string{"host"}, socket, formRun)
 	if err != nil {
 		t.Fatalf("probeRemoteSocketForm() error = %v", err)
 	}
@@ -201,6 +213,16 @@ func TestClassifyRemoteSocketFindsNoListenerBehindAnUnwritablePath(t *testing.T)
 	if !socketFileExists(t, socket) {
 		t.Error("the socket was removed on a connection reading that could not tell it apart from a leftover")
 	}
+}
+
+func classifyUnixSocketLocallyAsUnprivileged(t *testing.T, path string) (socketForwardVerdict, error) {
+	t.Helper()
+	forwardStandInSSHAsUnprivileged(t)
+	control, err := controlSocketPath(path)
+	if err != nil {
+		return forwardUnjudgeable, err
+	}
+	return classifyRemoteSocket([]string{"host"}, path, control)
 }
 
 // 在本机路径上跑真实判定: 替身ssh绑定本地端口, 再按远端主机的做法连接该路径,

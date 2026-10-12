@@ -90,8 +90,12 @@ stops: the path belongs to that host's own agent, and forwarding onto it would
 make gpg follow the wrong agent. A connection that closes without an answer,
 with that control in hand, is a leftover, and it is removed. The path is never
 removed when it cannot be written, when it is not a socket, or when the host
-cannot be asked or cannot answer - those all stop the session. --skip-remote-check
-is how the last group is started anyway, knowingly.
+cannot be asked or cannot answer - those all stop the session, and each error
+carries the way to deal with it. --skip-remote-check is how a session starts
+anyway when the host could not be asked or could not answer; it is no answer to
+a path your user there cannot write, where a refused connect and a socket
+nothing is listening on read the same, and the point is to stop rather than
+guess. Do not clear such a path by hand: something may be listening on it.
 `)
 }
 
@@ -185,9 +189,12 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 		return errors.New("ssh: no destination given (use: gpg-agent-forward ssh [ssh args] host)")
 	}
 
-	// 远端agent socket路径要问出来而不是猜: 它取决于远端uid和是否用非默认
-	// homedir; 猜错会让gpg走远端自己的agent, 拿远端密钥签名却像是成功.
+	// 远端agent socket路径要问不要猜: 取决于远端uid和非默认homedir, 猜错让gpg用远端密钥签名却像是成功.
+	// 本命令多开的两条连接都在跑之前往stderr打一行: ssh的主机密钥确认与口令提示写到/dev/tty.
+	// 提示不落在被捕获的流里, 出现时没有别的迹象说明是谁在问.
+	// 这些写未加锁, 只在这里安全: watchdog要到relay才起, 信号转发更晚.
 	if *remoteSocket == "" {
+		fmt.Fprintf(stderr, "gpg-agent-forward: asking the remote host where its agent socket is (ssh may prompt; the check gives up after %s)\n", sshQueryTimeout)
 		discovered, err := DiscoverRemoteSocket(sshArgs, runSSHQuery)
 		if err != nil {
 			return err
@@ -199,21 +206,20 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	}
 
 	// 拒绝覆盖远端主机自己的agent socket: 否则首次连接会顺带启动那个agent, gpg会静默用远端密钥签名.
-	// 无人监听的socket是残留, 挡着bind又没服务, 这里直接删掉让会话起来.
-	// 判据不是socket表而是远端主机本身: 回连无应答且有对照连接证明才算残留 (详见classifyRemoteSocket).
-	// 问不到或答不了的一律拒绝, `--skip-remote-check`明知风险放行, 有结论的不放行.
+	// 无人监听的socket是残留, 挡着bind又没服务, 这里删掉会话才能起.
+	// 判据是远端主机本身: 回连无应答且有对照连接证明这类连接被允许才算残留 (详见classifyRemoteSocket).
+	// 问不到或答不了就拒绝, 不检查正像sshd那样覆盖活动agent socket; `--skip-remote-check`明知风险放行.
+	fmt.Fprintf(stderr, "gpg-agent-forward: checking what is at %s on the remote host (ssh may prompt; the check gives up after %s)\n", *remoteSocket, sshQueryTimeout)
 	remoteState, err := CheckRemoteSocketFree(sshArgs, *remoteSocket, runSSHCommand)
-	unchecked := err != nil && *skipRemoteCheck && remoteState == socketUnjudgeable
-	if err != nil && !unchecked {
-		return err
-	}
-	switch remoteState {
-	case socketReclaimed:
-		fmt.Fprintf(stderr, "gpg-agent-forward: removed a leftover socket nothing was listening on at %s on the remote host\n", *remoteSocket)
-	case socketUnjudgeable:
-		if unchecked {
-			fmt.Fprintf(stderr, "gpg-agent-forward: --skip-remote-check: starting without checking what is at %s on the remote host\n", *remoteSocket)
+	if err != nil {
+		// 该flag只覆盖没能做成的检查: 已经给出结论的状态, flag说什么都拒绝.
+		if !(*skipRemoteCheck && remoteState.maySkipRemoteCheck()) {
+			return err
 		}
+		// 检查没能定论的东西正是用户判断要不要继续所需的, 所以打印出来而不是被flag吞掉.
+		fmt.Fprintf(stderr, "gpg-agent-forward: --skip-remote-check: starting without a verdict:\n  %v\n", err)
+	} else if remoteState == socketReclaimed {
+		fmt.Fprintf(stderr, "gpg-agent-forward: removed a leftover socket nothing was listening on at %s on the remote host\n", *remoteSocket)
 	}
 
 	// 从这里起的诊断 (下面这行, ssh的stderr, watchdog) 都走同一把锁,
