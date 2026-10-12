@@ -104,6 +104,29 @@ func TestRunSSHStopsAtASocketLeftOnTheRemoteHost(t *testing.T) {
 	}
 }
 
+func TestRunSSHRefusesALeftoverSocketWhateverTheFlagSays(t *testing.T) {
+	// 留下socket是已经得出的结论, `--skip-remote-check`只代表没能查, 不能越过它:
+	// 越过要靠错误里的命令或`--reclaim-remote-socket`; 放行它会在刚报告被占用的
+	// 路径上开session, 而用户还没对删除做决定.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSHForReclaim(t)
+
+	err, _ := runSSHAgainstStandIn(t, port, "--skip-remote-check")
+
+	if err == nil {
+		t.Fatal("Run(ssh) error = nil, want a refusal for a socket left at the remote path even with --skip-remote-check")
+	}
+	if !strings.Contains(err.Error(), "--reclaim-remote-socket") {
+		t.Errorf("error %v should name --reclaim-remote-socket as the way to have the leftover removed", err)
+	}
+	if got := fake.invocations(t); !slices.Equal(got, []string{"probe"}) {
+		t.Errorf("ssh invocations = %q, want [probe]: --skip-remote-check must not open a session on a verdict", got)
+	}
+}
+
 func TestRunSSHReclaimsASocketLeftOnTheRemoteHostWhenAsked(t *testing.T) {
 	// 带`--reclaim-remote-socket`时删除并报告: 对远端的改动必须让用户看得见.
 	if runtime.GOOS == "windows" {

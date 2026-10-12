@@ -10,11 +10,13 @@ import (
 // `DefaultRelayPort`是relay监听的loopback端口: 数字取好记的, 被占用时用`--port`改.
 const DefaultRelayPort = 29173
 
-// 用参数向量而不是shell字符串, 保住用户自己的ssh参数, 无引号与注入之虞.
-// 用户没自己配置`ExitOnForwardFailure`时补上: 缺了它失败是静默的, ssh只警告并保持会话,
-// 签名会悄悄改用远端主机上的agent, 用户却拿到有效签名, 想不到YubiKey从未参与.
+// 用参数向量而不是shell字符串: 保住用户自己的ssh参数, 无引号与注入之虞.
+// `-R`的参数经ssh的token展开(认识`%h`, `%d`等, 不认识的会拒绝启动), 故路径里的`%`要
+// 翻倍转义, 否则ssh监听的是展开结果而非探针查过的路径, 两个不同的socket, 其中一个由
+// 路径里的一个字节决定. 用户没配`ExitOnForwardFailure`时补上: 缺了它失败静默, ssh只
+// 警告并保持会话, 签名会悄悄改用远端主机上的agent, 用户却拿到有效签名, 想不到YubiKey从未参与.
 func BuildSSHArgs(userArgs []string, remoteSocket string, port int) []string {
-	spec := fmt.Sprintf("%s:127.0.0.1:%d", remoteSocket, port)
+	spec := fmt.Sprintf("%s:127.0.0.1:%d", escapePercent(remoteSocket), port)
 	args := make([]string, 0, len(userArgs)+4)
 	args = append(args, "-R", spec)
 	if !userSetForwardFailure(userArgs) {
@@ -22,6 +24,11 @@ func BuildSSHArgs(userArgs []string, remoteSocket string, port int) []string {
 	}
 	args = append(args, userArgs...)
 	return args
+}
+
+// ssh的token展开里, 字面的百分号要写成两个.
+func escapePercent(s string) string {
+	return strings.ReplaceAll(s, "%", "%%")
 }
 
 // 用户已显式设置它时沿用它, 不追加; ssh接受的任一写法都算.
@@ -119,7 +126,8 @@ func ValidatePort(port int) error {
 // 地址分隔符, 超长则越过两端都强制的`sockaddr_un`上限(含终止符108字节, 可用107).
 // 控制字符同理: 换行会让交给远端登录shell的单行探针散成多行, `csh`/`tcsh`拒绝跨行的
 // 引号词而什么都不跑, 调用方只能读成问不到主机; 其余C0控制符与DEL还会破坏路径与远端
-// 回报地址的匹配, 详见`remoteSocketProbe`; 空格和单引号合法, 本检查先于构造探针.
+// 回报地址的匹配, 详见`remoteSocketProbe`; 空格和单引号合法, 探针会为远端shell给路径加引号,
+// 本检查先于构造探针; 百分号同理, 由`BuildSSHArgs`转义而不是在这里拒绝.
 func ValidateRemoteSocket(p string) error {
 	if p == "" {
 		return fmt.Errorf("remote socket path is empty")

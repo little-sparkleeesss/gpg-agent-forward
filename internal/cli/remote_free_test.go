@@ -44,6 +44,25 @@ func TestCheckRemoteSocketFreeRefusesALeftoverSocket(t *testing.T) {
 	}
 }
 
+func TestCheckRemoteSocketFreeRefusesAPathItCannotResolve(t *testing.T) {
+	// 查表问的是解析后的拼写, 解析不了的主机就没回答删除所依赖的问题:
+	// 路径指向的东西可能位于两张表从未被问起的地方. 关于主机的socket表本身什么都没学到,
+	// 所以这是未决结论而非结论, 和同类一样带`--skip-remote-check`.
+	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketUnresolvedMarker))
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the path cannot be resolved")
+	}
+	if !strings.Contains(err.Error(), "readlink") {
+		t.Errorf("error %v should name the resolution as what failed", err)
+	}
+	if strings.Contains(err.Error(), "/proc/net/unix") {
+		t.Errorf("error %v should not blame the kernel's socket table, which was read fine", err)
+	}
+	if !strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
+	}
+}
+
 func TestCheckRemoteSocketFreeRefusesALiveSocket(t *testing.T) {
 	// 活socket属于远端自己的gpg-agent: 转发到它要靠`StreamLocalBindUnlink`顶掉占位,
 	// 会把gpg静默导向那里应答的东西, 所以报告为问题, 不能覆盖.
@@ -157,38 +176,7 @@ func TestCheckRemoteSocketFreeRefusesASymlink(t *testing.T) {
 }
 
 // 探针自身行为(删什么, 留什么, 拒绝判什么)靠`remote_probe_test.go`真跑它生成的命令覆盖:
-// 只比对命令文本抓不到`ss`失败被读成"无人监听".
-
-func TestRemoteSocketProbeEscapesAQuoteInThePath(t *testing.T) {
-	// `ValidateRemoteSocket`不拒绝单引号, 含单引号的路径必须以字面文本到达远端,
-	// 而不是提前闭合引号; 这里转义要过两层: 路径在脚本里被引号一次, 脚本再为`sh -c`引号一次.
-	const quotePath = "/tmp/x';id;echo '"
-	var seen string
-	run := func(_ []string, cmd string) (string, error) {
-		seen = cmd
-		return socketAbsentMarker + "\n", nil
-	}
-	CheckRemoteSocketFree([]string{"host"}, quotePath, keepLeftover, run)
-
-	if !strings.HasPrefix(seen, "sh -c ") {
-		t.Fatalf("remote command %q should run under sh", seen)
-	}
-	// 去掉外层引号, 按远端`sh`的读法看脚本: 里面的路径必须是单独一个单引号词,
-	// 这样路径里的";id;"才不会是独立命令.
-	script := shellUnquoteSingle(strings.TrimPrefix(seen, "sh -c "))
-	want := "p=" + shellQuoteSingle(quotePath)
-	if !strings.Contains(script, want) {
-		t.Errorf("script does not carry the path as one quoted word:\n  got  %q,\n want it to contain %q", script, want)
-	}
-}
-
-// `shellUnquoteSingle`是`shellQuoteSingle`的逆操作, 便于测试按shell的读法还原引号串.
-func shellUnquoteSingle(s string) string {
-	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
-		s = s[1 : len(s)-1]
-	}
-	return strings.ReplaceAll(s, `'\''`, "'")
-}
+// 只比对文本抓不到`ss`失败被读成"无人监听", 也看不出路径被远端登录shell当命令跑掉.
 
 func TestCheckRemoteSocketFreeSurfacesRunnerFailure(t *testing.T) {
 	run := func([]string, string) (string, error) { return "", errors.New("ssh: connection failed") }

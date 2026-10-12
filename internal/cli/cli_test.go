@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -93,6 +95,50 @@ func TestBuildSSHArgsDoesNotMutateInput(t *testing.T) {
 	BuildSSHArgs(in, "/s", 1234)
 	if len(in) != 2 || in[0] != "-p" || in[1] != "22" {
 		t.Errorf("input slice was mutated: %q", in)
+	}
+}
+
+func TestBuildSSHArgsEscapesThePercentSign(t *testing.T) {
+	// ssh会展开`-R`参数里的`%`记号: 路径里的`%h`变成远端主机名, 探针查一个路径而sshd
+	// 绑另一个; 不认识的记号 (如`%Q`) 让ssh直接拒绝启动. 字面百分号要写成`%%`.
+	got := BuildSSHArgs(nil, "/run/user/1000/gnupg%h/S.gpg-agent", 29173)
+	want := "/run/user/1000/gnupg%%h/S.gpg-agent:127.0.0.1:29173"
+	if got[1] != want {
+		t.Errorf("forward spec = %q, want %q", got[1], want)
+	}
+}
+
+func TestRemoteSocketForwardSpecSurvivesRealSSHPercentExpansion(t *testing.T) {
+	// 转义有没有用要问ssh本身: `-G`打印它将建立的转发 (百分号已展开), 其中的socket必须
+	// 与探针检查的一致. 运行失败或该ssh不支持`-G`时跳过而非失败: 答案只关乎测试机的ssh.
+	if runtime.GOOS == "windows" {
+		t.Skip("ssh -G is asked for on the test host")
+	}
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skipf("no ssh on PATH to ask what -R means: %v", err)
+	}
+	const path = "/run/user/1000/gnupg%h/S.gpg-agent"
+	spec := BuildSSHArgs(nil, path, 29173)[1]
+	// `-F /dev/null`把测试机自己的配置挡在答案之外.
+	out, err := exec.Command(sshBin, "-F", "/dev/null", "-G", "-R", spec, "example.invalid").Output()
+	if err != nil {
+		t.Skipf("ssh could not report what -R %s would set up: %v", spec, err)
+	}
+	listen := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		rest, ok := strings.CutPrefix(line, "remoteforward ")
+		if !ok {
+			continue
+		}
+		listen, _, _ = strings.Cut(rest, " ")
+		break
+	}
+	if listen == "" {
+		t.Skipf("ssh -G did not report a remote forward for %q:\n%s", spec, out)
+	}
+	if listen != path {
+		t.Errorf("ssh would listen on %q, want %q: the probe checks one and sshd binds the other", listen, path)
 	}
 }
 

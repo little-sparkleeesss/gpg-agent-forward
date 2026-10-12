@@ -229,6 +229,20 @@ func shellQuoteSingle(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// octalEscapes: 把s的每个字节变成三位八进制转义, 结果里没有s的任何字节, 用作远端printf的格式串;
+// 用八进制不用\xHH, 因为远端printf按POSIX读回\NNN.
+// 远端用户的登录shell在sh之前解析命令行, 而csh/tcsh连单引号内也做历史展开: 路径里的"!"会让
+// 命令报"Event not found"而什么都不跑; 引号救不了 (美元符号, 反引号, 波浪号同样是特殊字符,
+// 也都是路径的合法字节), 只能不让路径的字节上命令行; 也让ssh对`-R`的百分号展开无事可做.
+func octalEscapes(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) * 4)
+	for i := 0; i < len(s); i++ {
+		fmt.Fprintf(&b, `\%03o`, s[i])
+	}
+	return b.String()
+}
+
 // 探针的判定标记按整行匹配, 不按子串: 登录横幅里可能出现"present"这类普通词.
 const (
 	socketAbsentMarker     = "gpg-agent-forward-socket-absent"
@@ -238,6 +252,7 @@ const (
 	socketStaleMarker      = "gpg-agent-forward-socket-stale"
 	socketStuckMarker      = "gpg-agent-forward-socket-stuck"
 	socketUnknownMarker    = "gpg-agent-forward-socket-unknown"
+	socketUnresolvedMarker = "gpg-agent-forward-socket-unresolved"
 	socketSymlinkMarker    = "gpg-agent-forward-socket-symlink"
 )
 
@@ -252,6 +267,7 @@ const (
 	socketStuck                                // 死socket还在, 删不掉
 	socketUnjudgeable                          // 主机无法判定
 	socketUnreported                           // 探针没有报出任何判定
+	socketUnresolved                           // 路径在主机上无法解析
 	socketSymlink                              // 路径是符号链接
 )
 
@@ -271,47 +287,86 @@ const (
 // 写成常量是为了让测试能替换这个名字: 绝对路径`/proc/net/unix`没法被unmount或改成不可读.
 const procNetUnixPath = "/proc/net/unix"
 
-// 判定与删除同在一条远端命令:只有远端分得清死活,分两次只会拉大关不掉的窗口(检查与`rm`仍隔进程).
-// 命令必须单行:sshd把整串交给登录shell,`csh`/`tcsh`遇跨行引号词整条不跑.只做能正面排除的删除:
-// 活socket永不删,两路来源都可读且都没提才可删:`ss`(会过滤行,或就是错的)与内核的`/proc/net/unix`;
-// 内核表列所有已bind的socket,`ss -xl`只列listener,矛盾时以内核为准;任一名列路径即为活;
-// 路径按整字段而非子串匹配,绝不按inode:内核的inode列是socket的sockfs inode,与路径文件的inode不同;
-// 符号链接只报不可判定:内核记的是监听者绑的路径,未必是链接自身的名字;读不到的来源不算"没提".
+// ssStatusTag: 探针在ss的表后面打的那行, 带ss的退出状态.
+// 状态随它所属的输出一起回来, 一次ss运行就同时回答"ss说了什么"和"ss到底跑没跑".
+const ssStatusTag = "gpg-agent-forward-ss-status"
+
+// remoteSocketProbe: 构建报告path处情况的远端命令, 只在reclaim允许时删除死socket.
+// 判定与删除同行: 只有主机能分辨死socket与活socket; 检查与rm之间仍有竞态, 远端无锁可拿.
+// 命令必须是一行: sshd先把整串交给远端用户的登录shell, csh/tcsh拒绝跨行的引号词 (Unmatched '),
+// 于是什么都不跑; sh -c只为脚本体给出已知解释器; 删除只做能正面排除的情况: 活socket永不删;
+// ss是程序, 可能过滤行或出错, 单凭它不算数; 要`ss -xl`与`/proc/net/unix`两个独立来源都说路径已死,
+// 读不到的来源不算"没有"; 内核表按路径而非inode匹配; 解码先经证明 (\134读回与反斜杠比较).
 func remoteSocketProbe(path string, reclaim reclaimPolicy) string {
 	// 两个来源都否认时:删除是对远端的改动,仅在调用方要求时做,默认只报状态
 	leftoverArm := "else echo " + socketStaleMarker + "; fi;"
 	if reclaim == reclaimLeftover {
-		leftoverArm = "elif rm -f -- \"$p\"; then echo " + socketReclaimedMarker + "; else echo " + socketStuckMarker + "; fi;"
+		// 删除用解析后的拼写,不用用户输入的那个:检查过表的是解析后的拼写,
+		// 目录组件在检查与删除之间换了指向时,删除不得改到表从未查过的文件上.
+		leftoverArm = "elif rm -f -- \"$np\"; then echo " + socketReclaimedMarker + "; else echo " + socketStuckMarker + "; fi;"
 	}
 
 	// 分片拼接只为可读;这条远程命令必须保持单行
 	script := strings.Join([]string{
-		"p=" + shellQuoteSingle(path) + ";",
+		// 路径在脚本内解码而非写进命令:一个字节也不能上命令行,原因详见`octalEscapes`.
+		// 解码取决于宿主机的`printf`:POSIX要求它读`\NNN`,不支持的实现会把转义原样打印,
+		// 那样的`p`既非空也非路径,每项检查都答"否",会报成路径不存在,正是本探针要避免的判定.
+		// 故先验证解码:用`\134`(反斜杠的转义)检验`printf`;这是对`printf`的检验,不是对路径的限制.
+		`[ "$(printf '\134')" = '\' ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
+		"p=$(printf " + shellQuoteSingle(octalEscapes(path)) + ");",
+		// 解码的另一种失败:`printf`不存在或对格式什么都不打印,得到空路径;
+		// 空`p`不是文件,每项检查都会对没查过的路径答"否",与`printf`把转义原样打印时是同一种误读.
+		"[ -n \"$p\" ] || { echo " + socketUnknownMarker + "; exit 0; };",
+		// cand PATH OTHERPATH [GREP ARGS...]:留下表里提到任一path的行,
+		// 以及调用方模式选中的行,每行补一个尾随空格.OTHERPATH可为空,表示没有第二种拼写.
+		// 表本身不进shell变量:几十万socket的表有几十MB,shell得先吃下全部才能看;
+		// `grep`流式读,只留提到路径的少数行.
+		// 行尾空格让整字段判定可行:shell模式锚不住行尾,否则行末路径会像更长名字的前缀.
+		"cand() { q=$1; r=$2; shift 2; if [ -n \"$r\" ]; then grep -F -e \" $q\" -e \" $r\" \"$@\" | sed 's/$/ /'; else grep -F -e \" $q\" \"$@\" | sed 's/$/ /'; fi; };",
 		"if [ -L \"$p\" ]; then echo " + socketSymlinkMarker + ";",
 		"elif [ -e \"$p\" ]; then",
 		"if [ -S \"$p\" ]; then",
-		// 先读内核表:单凭它就能判路径被占用,没`ss`的主机也报得出活socket,
-		// 否则用户会去开`--skip-remote-check`.表展平后与`ss`一样匹配,
-		// 一个" $p "模式覆盖每行,行末路径也算.
-		"procflat=;",
-		"if [ -r " + procNetUnixPath + " ]; then procflat=$(tr '\\n' ' ' < " + procNetUnixPath + " 2>/dev/null); fi;",
+		// 向表询问的是解析后的拼写,未必是用户写的那个:内核按监听者绑定的拼写记录,
+		// 经符号链接,".."或重复斜杠到达的路径,对按用户拼写的搜索不可见,
+		// 而"两个表都不可见"正是删除的依据.
+		// 只解析目录,最后一段保持原样,路径本身是符号链接时仍判不了.
+		// `readlink -f`是解析目录的办法,没有它时用`realpath`;仅在指向同一文件时才采用其结果.
+		"np=;",
+		"case $p in */*) nd=${p%/*}; ns=${p##*/};; *) nd=.; ns=$p;; esac;",
+		"[ -n \"$nd\" ] || nd=/;",
+		"rp=$(readlink -f -- \"$nd\" 2>/dev/null) || rp=;",
+		"[ -n \"$rp\" ] || rp=$(realpath -- \"$nd\" 2>/dev/null) || rp=;",
+		"if [ -n \"$rp\" ]; then case $rp in */) np=$rp$ns;; *) np=$rp/$ns;; esac; fi;",
+		"if [ -n \"$np\" ] && [ \"$p\" -ef \"$np\" ] 2>/dev/null; then :; else np=; fi;",
+		// 含控制字符的路径无法按整字段搜索:搜索的单位是行,名字里有换行就成了两个字段.
+		// 只有符号链接的目标能造出这种路径,它使"没有绑定到该路径"不可证.
+		"case $np in *[[:cntrl:]]*) np=;; esac;",
+		// 先读内核表:单凭它就能判路径被占用,没`ss`的主机也报得出活agent socket,
+		// 否则这类主机上用户会去开`--skip-remote-check`.
+		"proc_table=no; proc_live=no;",
+		"if [ -r " + procNetUnixPath + " ]; then",
 		// 表头按两个相邻列名匹配而非整行:内核用成串空格补齐,模式里没有"一个或多个".
 		// 这两个词是文件真被读到的证据:可读却永不应答的占位文件不能当作省略该路径的表.
-		"proc_table=no; case \" $procflat \" in *\"RefCount Protocol \"*) proc_table=yes;; esac;",
-		"proc_live=no; case \" $procflat \" in *\" $p \"*) proc_live=yes;; esac;",
+		// 表头在第一行,查到此即停.
+		"grep -F -q -e 'RefCount Protocol ' < " + procNetUnixPath + " 2>/dev/null && proc_table=yes;",
+		"proc_cand=$(cand \"$p\" \"$np\" < " + procNetUnixPath + " 2>/dev/null);",
+		"case \"$proc_cand\" in *\" $p \"*) proc_live=yes;; esac;",
+		"if [ \"$proc_live\" = no ] && [ -n \"$np\" ] && [ \"$np\" != \"$p\" ]; then case \"$proc_cand\" in *\" $np \"*) proc_live=yes;; esac; fi;",
+		"fi;",
 		"if [ \"$proc_live\" = yes ]; then echo " + socketLiveMarker + ";",
 		"elif command -v ss >/dev/null 2>&1; then",
-		"out=$(LC_ALL=C ss -xl 2>/dev/null); st=$?;",
-		// 先看`ss`自己的退出状态再读输出:管道只报最后一条命令的状态,
-		// 跑起来却失败的`ss`什么都不打印,与"无人监听"长得一模一样.
-		"if [ \"$st\" -ne 0 ]; then echo " + socketUnknownMarker + ";",
-		"else flat=$(printf '%s' \"$out\" | tr '\\n' ' ');",
-		"has_table=no; case \" $flat \" in *\" Netid State\"*) has_table=yes;; esac;",
-		"live=no; case \" $flat \" in *\" $p \"*) live=yes;; esac;",
-		"if [ \"$live\" = yes ]; then echo " + socketLiveMarker + ";",
-		"elif [ \"$has_table\" = no ] || [ \"$proc_table\" = no ]; then echo " + socketUnknownMarker + ";",
+		// `ss`的退出状态随其输出一起带回而非存进变量:管道只报最后一条命令的状态,
+		// 要单独拿`ss`的状态就得先存下整张表;探针把状态作为表后一行打印,与表一起被`grep`捞出.
+		"ss_cand=$( { LC_ALL=C ss -xl 2>/dev/null; printf '\\n%s=%s\\n' " + ssStatusTag + " \"$?\"; } " +
+			"| cand \"$p\" \"$np\" -e '" + ssStatusTag + "=' -e 'Netid State ' );",
+		"ss_ok=no; case \"$ss_cand\" in *\"" + ssStatusTag + "=0 \") ss_ok=yes;; esac;",
+		"ss_table=no; case \"$ss_cand\" in *'Netid State '*) ss_table=yes;; esac;",
+		"ss_live=no; case \"$ss_cand\" in *\" $p \"*) ss_live=yes;; esac;",
+		"if [ \"$ss_live\" = no ] && [ -n \"$np\" ] && [ \"$np\" != \"$p\" ]; then case \"$ss_cand\" in *\" $np \"*) ss_live=yes;; esac; fi;",
+		"if [ \"$ss_live\" = yes ]; then echo " + socketLiveMarker + ";",
+		"elif [ -z \"$np\" ]; then echo " + socketUnresolvedMarker + ";",
+		"elif [ \"$ss_ok\" = no ] || [ \"$ss_table\" = no ] || [ \"$proc_table\" = no ]; then echo " + socketUnknownMarker + ";",
 		leftoverArm,
-		"fi;",
 		"else echo " + socketUnknownMarker + "; fi;",
 		"else echo " + socketNotASocketMarker + "; fi;",
 		"else echo " + socketAbsentMarker + "; fi",
@@ -345,6 +400,8 @@ func probeRemoteSocket(sshArgs []string, remoteSocket string, reclaim reclaimPol
 			return socketStuck, nil
 		case socketUnknownMarker:
 			return socketUnjudgeable, nil
+		case socketUnresolvedMarker:
+			return socketUnresolved, nil
 		case socketSymlinkMarker:
 			return socketSymlink, nil
 		}
@@ -356,10 +413,9 @@ func probeRemoteSocket(sshArgs []string, remoteSocket string, reclaim reclaimPol
 
 // 让sshd即将绑定的远端路径可用,不可用则说明原因.
 // 活socket属于远端自己的gpg-agent:转发时sshd的`StreamLocalBindUnlink`会顶掉它占位,
-// gpg便静默连上别的agent,故拒绝覆盖.
-// 无人监听的遗留由调用方(reclaim)决定:证据只管一个网络命名空间,默认`keepLeftover`停下引导,
-// 用户可手动删除或开`--reclaim-remote-socket`;`reclaimLeftover`则删除后放行.
-// 仅error为nil才放行;判不出来者拒绝并带`--skip-remote-check`,明确判定(如`socketStale`)只带删除指引.
+// gpg便静默连上别的agent,故拒绝覆盖.无人监听的遗留由调用方(reclaim)决定删不删:
+// 证据只管一个网络命名空间,默认`keepLeftover`停下引导,`reclaimLeftover`删除后放行.
+// 仅error为nil才放行;判不出来(问不到,解不了路径,读不了表)一律拒绝并带`--skip-remote-check`.
 func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, reclaim reclaimPolicy, run SSHCommandRunner) (remoteSocketState, error) {
 	state, err := probeRemoteSocket(sshArgs, remoteSocket, reclaim, run)
 	if err != nil {
@@ -410,11 +466,23 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, reclaim reclai
 			"%s on the remote host is a symbolic link, so whether a live agent socket is behind it cannot be told from here.\n"+
 				"  Refusing to remove the link or to bind over it. Point --remote-socket PATH at the real path instead.",
 			remoteSocket)
-	default: // socketUnjudgeable:两路证据都没答
+	case socketUnresolved:
 		return state, fmt.Errorf(
-			"could not tell whether %s on the remote host is in use: the host could not read both of its socket tables.\n"+
+			"could not work out what %s on the remote host resolves to, so whether the path is in use cannot be told there.\n"+
+				"  The path is matched under the spelling its listener would have bound as well as the one given, and the\n"+
+				"  host could not do that resolution: readlink -f and realpath both failed on the directory, or answered\n"+
+				"  something that is not the same file. Nothing was removed.\n"+
+				"  Pass --remote-socket PATH to use a different path, or --skip-remote-check to start without the check\n"+
+				"  and accept that sshd may bind over a live agent socket.",
+			remoteSocket)
+	default: // socketUnjudgeable:远端没回答本检查所问的问题
+		return state, fmt.Errorf(
+			"could not tell whether %s on the remote host is in use: the host could not answer the questions the check turns on.\n"+
 				"  This is the verdict when ss is missing, fails, or prints something that is not a socket table,\n"+
-				"  and when the kernel's /proc/net/unix cannot be read there. Nothing was removed.\n"+
+				"  when the kernel's /proc/net/unix cannot be read there - the probe reads those tables with grep\n"+
+				"  and sed, so a host without them answers the same way - and when the host's printf does not read\n"+
+				"  the \\NNN escapes the path travels as, which leaves the probe with no path to ask about.\n"+
+				"  Nothing was removed.\n"+
 				"  Remove the file there if nothing should be using it, pass --remote-socket PATH to use a different path,\n"+
 				"  or pass --skip-remote-check to start without the check and accept that sshd may bind over a live agent socket.",
 			remoteSocket)

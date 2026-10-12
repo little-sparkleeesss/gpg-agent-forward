@@ -202,21 +202,21 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	// 拒绝覆盖远端主机自己的agent socket: 否则首次连接会顺带启动那个agent, gpg会静默用远端密钥签名.
 	// 残留socket只在用户要求 (`--reclaim-remote-socket`) 时才删并报告; 否则停下, 错误里给出删除命令.
 	// 判据是远端socket表, 只描述一个network namespace, 分不清残留和共享目录的容器里的agent.
-	// 探针跑不起来或判不了路径的也一律拒绝; `--skip-remote-check`明知风险放行, 有结论的不放行.
+	// 探针跑不起来, 判不了路径或说不清解析结果的拒绝; `--skip-remote-check`明知风险放行, 有结论不放行.
 	reclaim := keepLeftover
 	if *reclaimRemoteSocket {
 		reclaim = reclaimLeftover
 	}
 	remoteState, err := CheckRemoteSocketFree(sshArgs, *remoteSocket, reclaim, runSSHCommand)
 	unchecked := err != nil && *skipRemoteCheck &&
-		(remoteState == socketUnreported || remoteState == socketUnjudgeable)
+		(remoteState == socketUnreported || remoteState == socketUnjudgeable || remoteState == socketUnresolved)
 	if err != nil && !unchecked {
 		return err
 	}
 	switch remoteState {
 	case socketReclaimed:
 		fmt.Fprintf(stderr, "gpg-agent-forward: removed a leftover socket nothing was listening on at %s on the remote host\n", *remoteSocket)
-	case socketUnreported, socketUnjudgeable:
+	case socketUnreported, socketUnjudgeable, socketUnresolved:
 		if unchecked {
 			fmt.Fprintf(stderr, "gpg-agent-forward: --skip-remote-check: starting without checking what is at %s on the remote host\n", *remoteSocket)
 		}
