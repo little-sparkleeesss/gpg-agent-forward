@@ -1,55 +1,31 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
-// 探针是POSIX shell命令, 故这些测试用`sh`真跑并读输出, 不做命令文本匹配:
-// 它防的缺陷 - `ss`失败被读成"无人监听", 地址子串匹配 - 只在脚本跑起来时现形.
-
-// 探针以这行表头作为`ss`答过话的证据, 故替身也必须打印它.
-const ssHeader = "Netid State  Recv-Q Send-Q  Local Address:Port     Peer Address:Port"
-
-// 内核unix socket表的表头: 探针的第二证据源, 空白列距是内核原样, 替身不得整理.
-const procTableHeader = "Num       RefCount Protocol Flags    Type St Inode Path"
-
-func procTableStub(t *testing.T, table string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "unix")
-	if err := os.WriteFile(path, []byte(table), 0o644); err != nil {
-		t.Fatalf("write the stand-in socket table: %v", err)
-	}
-	return path
-}
-
-// `/proc/net/unix`是测试无法卸载或遮蔽的绝对路径, 故换成同样性质的缺失路径;
-// 脚本把它写成一个字面量, `replaceProbeSource`负责整体替换.
-func missingProcTable(t *testing.T) string {
-	t.Helper()
-	return filepath.Join(t.TempDir(), "unix")
-}
-
-// 改写探针命令后再跑: 用来造出本机内核表本身做不出的分支.
-func replaceProbeSource(run SSHCommandRunner, old, new string) SSHCommandRunner {
-	return func(sshArgs []string, remoteCommand string) (string, error) {
-		return run(sshArgs, strings.ReplaceAll(remoteCommand, old, new))
-	}
-}
+// 预检两件事都靠真跑而非匹配命令文本: 所防缺陷只在运行时行为里显现.
+// 分类要一个真绑本地端口, 连远端路径的ssh, 由TestForwardSSHHelper重执行本测试二进制充当:
+// 是被测生产代码classifyRemoteSocket的对端, 不是mock.
 
 func requireShell(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
-		t.Skip("the probe is a POSIX shell command")
+		t.Skip("the remote command is a POSIX shell command")
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skipf("sh is not on PATH to run the probe with: %v", err)
+		t.Skipf("sh is not on PATH to run the command with: %v", err)
 	}
 }
 
@@ -65,7 +41,7 @@ func envWithPath(path string) []string {
 	return append(env, "PATH="+path)
 }
 
-// 像远端登录shell那样把命令串交给`sh`跑, 并由`PATH`决定探针找到哪个`ss`.
+// 像远端登录shell那样把命令串交给`sh`跑, 并由`PATH`决定远端能找到什么.
 func localProbeRunner(path string) SSHCommandRunner {
 	return func(_ []string, remoteCommand string) (string, error) {
 		cmd := exec.Command("sh", "-c", remoteCommand)
@@ -75,48 +51,19 @@ func localProbeRunner(path string) SSHCommandRunner {
 	}
 }
 
-// 首选本机真`ss`, 测试与生产解析同一份输出; 无`ss`时才用替身.
-// 替身只答"路径上有没有监听者", 不答"`ss`会不会打印它";
-// 两者皆无的主机跳过, 不退而求其次.
-func ssPathForProbe(t *testing.T) string {
+// 只有shell的`PATH`, 代表一台什么工具都没有的远端主机: 形态命令的答案全来自
+// shell自带的测试, 那台主机可以没有`ss`, `grep`, `sed`, `readlink`, `stat`.
+func pathWithOnlySh(t *testing.T) string {
 	t.Helper()
-	if _, err := exec.LookPath("ss"); err == nil {
-		return os.Getenv("PATH")
-	}
-	if _, err := os.Stat("/proc/net/unix"); err != nil {
-		t.Skipf("no ss on the test host and no /proc/net/unix to stand in for it: %v", err)
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("sh is not on PATH: %v", err)
 	}
 	dir := t.TempDir()
-	script := "#!/bin/sh\n" +
-		"echo " + shellQuoteSingle(ssHeader) + "\n" +
-		"cat /proc/net/unix\n"
-	if err := os.WriteFile(filepath.Join(dir, "ss"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write the ss stand-in: %v", err)
+	if err := os.Symlink(sh, filepath.Join(dir, "sh")); err != nil {
+		t.Fatalf("link sh into an otherwise empty PATH: %v", err)
 	}
-	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
-}
-
-func ssStub(t *testing.T, table string) string {
-	t.Helper()
-	dir := t.TempDir()
-	tableFile := filepath.Join(dir, "table")
-	if err := os.WriteFile(tableFile, []byte(table), 0o644); err != nil {
-		t.Fatalf("write the ss table: %v", err)
-	}
-	script := "#!/bin/sh\ncat " + shellQuoteSingle(tableFile) + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "ss"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write the ss stub: %v", err)
-	}
-	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
-}
-
-func brokenSSStub(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "ss"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-		t.Fatalf("write the ss stub: %v", err)
-	}
-	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
+	return dir
 }
 
 // 关掉unix监听器默认会连socket文件一起删掉.
@@ -129,7 +76,7 @@ func listenAt(t *testing.T, path string) *net.UnixListener {
 	return l.(*net.UnixListener)
 }
 
-// 造一个无人监听的socket文件: 已结束的会话转发留下的状态, 探针唯一允许删的东西.
+// 造一个无人监听的socket文件: 已结束的会话转发留下的状态, 检查唯一允许删的东西.
 func deadSocketAt(t *testing.T, path string) {
 	t.Helper()
 	l := listenAt(t, path)
@@ -149,24 +96,62 @@ func socketFileExists(t *testing.T, path string) bool {
 	return err == nil
 }
 
-func TestRemoteSocketProbeCommandIsOneLine(t *testing.T) {
+// 造一个接受连接但一言不发的socket: `gpg-agent`就长这样, 分类把它读作live.
+func liveSocketAt(t *testing.T, path string) net.Listener {
+	t.Helper()
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", path, err)
+	}
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				c.Close()
+			}
+		}()
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c)
+		}
+	}()
+	return l
+}
+
+// 探针在被测路径旁创建控制socket, 两者要一起挤进`sun_path`的107字节上限:
+// `t.TempDir`把用例全名编进路径, 名字长的用例会因此撞上限, 与被测行为无关.
+// 路径要够短的用例改用本helper, 免得用例名一长就得到与检查无关的失败.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "gpg-agent-forward-")
+	if err != nil {
+		t.Fatalf("make a short scratch directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func TestRemoteSocketFormCommandIsOneLineUnderSh(t *testing.T) {
 	// sshd先把命令交给远端登录shell: `csh`/`tcsh`对跨行的引号串报"Unmatched '",
-	// 之后什么都不跑, 故多行命令的探针报不出结论.
-	cmd := remoteSocketProbe("/run/user/1000/gnupg/S.gpg-agent", keepLeftover)
+	// 之后什么都不跑, 所以多行命令永远报不出结论.
+	cmd := remoteSocketForm("/run/user/1000/gnupg/S.gpg-agent")
 	if strings.ContainsAny(cmd, "\n\r") {
-		t.Errorf("probe %q spans lines, which the remote login shell refuses to parse", cmd)
+		t.Errorf("command %q spans lines, which the remote login shell refuses to parse", cmd)
 	}
 	if !strings.HasPrefix(cmd, "sh -c ") {
-		t.Errorf("probe %q does not run its body under sh", cmd)
+		t.Errorf("command %q does not run its body under sh", cmd)
 	}
 }
 
-func TestRemoteSocketProbeCommandRunsUnderTcsh(t *testing.T) {
+func TestRemoteSocketFormCommandRunsUnderTcsh(t *testing.T) {
 	// FreeBSD root登录时sshd用的shell; `-f`跳过cshrc, 只量命令不量登录环境.
 	// `csh`/`tcsh`连单引号里也做历史展开, 故路径字节在脚本内解码, 不上命令行.
 	tcsh, err := exec.LookPath("tcsh")
 	if err != nil {
-		t.Skip("tcsh is not installed; TestRemoteSocketProbeCommandIsOneLine covers the shape it rejects")
+		t.Skip("tcsh is not installed; TestRemoteSocketFormCommandIsOneLineUnderSh covers the shape it rejects")
 	}
 	paths := map[string]string{
 		"an ordinary path": filepath.Join(t.TempDir(), "S.gpg-agent"),
@@ -174,12 +159,12 @@ func TestRemoteSocketProbeCommandRunsUnderTcsh(t *testing.T) {
 	}
 	for name, path := range paths {
 		t.Run(name, func(t *testing.T) {
-			out, err := exec.Command(tcsh, "-f", "-c", remoteSocketProbe(path, keepLeftover)).Output()
+			out, err := exec.Command(tcsh, "-f", "-c", remoteSocketForm(path)).Output()
 			if err != nil {
-				t.Fatalf("tcsh could not run the probe: %v (output %q)", err, out)
+				t.Fatalf("tcsh could not run the command: %v (output %q)", err, out)
 			}
 			if !strings.Contains(string(out), socketAbsentMarker) {
-				t.Errorf("tcsh ran the probe but reported %q, want the absent marker in it", out)
+				t.Errorf("tcsh ran the command but reported %q, want the absent marker in it", out)
 			}
 		})
 	}
@@ -196,15 +181,14 @@ func TestOctalEscapesRoundTripThroughTheShell(t *testing.T) {
 		"/run/user/1000/back\\slash/S.gpg-agent",
 		"/run/user/1000/gnupg-代理/S.gpg-agent",
 	}
-	// `-f`跳过shell自己的启动文件(这里是本机cshrc), 量的是解析命令而非登录环境.
-	// `tcsh`自己不做`p=$(...)`, 只需把引号串原样传下去, 解码仍交给`sh`.
+	// `-f`跳过shell自己的启动文件(这里是本机cshrc): 量的是解析命令, 不是登录环境.
 	type shell struct {
 		binary string
 		args   []string
 		wrap   func(cmd string) string
 	}
 	inner := func(path string) string {
-		// 格式串照探针的传法加引号: 不加的话shell会把转义自己吃掉.
+		// 格式串照命令的传法加引号: 不加的话shell会把转义自己吃掉.
 		return "p=$(printf " + shellQuoteSingle(octalEscapes(path)) + "); printf '%s' \"$p\""
 	}
 	var shells []shell
@@ -229,25 +213,261 @@ func TestOctalEscapesRoundTripThroughTheShell(t *testing.T) {
 	}
 }
 
-// 编码后的路径唯一会变空的途径: 主机的shell解不出来, 脚本等于没东西可查.
-// 空路径不是文件, 诚实的结论只能是问不了主机, 绝不能是路径空闲.
-func TestRemoteSocketProbeRefusesAnEmptyPath(t *testing.T) {
+// 查命令形状而非行为: 缺陷在行为上看不见 - 路径以`printf`编码出行, 从不以自身出现.
+// `csh`/`tcsh`连单引号里也做历史展开, 路径里的`!`会让命令当场结束;
+// 加引号救不了: `$`, `~`和反引号同样被特殊对待, 且都是合法路径字节, 唯一出路是在脚本内解码.
+func TestRemoteSocketFormNeverPutsThePathOnTheCommandLine(t *testing.T) {
 	requireShell(t)
-	state, err := probeRemoteSocket([]string{"host"}, "", keepLeftover, localProbeRunner(os.Getenv("PATH")))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
+	canary := filepath.Join(t.TempDir(), "canary")
+	paths := []string{
+		"/run/user/1000/gnupg!bang/S.gpg-agent",
+		"/run/user/1000/gnupg%h/S.gpg-agent",
+		"/run/user/1000/it's/S.gpg-agent",
+		"/run/user/1000/with space/S.gpg-agent",
+		"/run/user/1000/`id`/$HOME/S.gpg-agent",
+		"/run/user/1000/back\\slash/S.gpg-agent",
+		"/run/user/1000/gnupg-\xe4\xbb\xa3\xe7\x90\x86/S.gpg-agent",
+		"/run/user/1000/x';touch " + canary + ";'/S.gpg-agent",
 	}
-	if state != socketUnjudgeable {
-		t.Fatalf("state = %v, want socketUnjudgeable: an empty path is not a free one", state)
+	for _, command := range []string{
+		remoteSocketForm(paths[0]),
+		remoteSocketRemove(paths[0]),
+	} {
+		for _, path := range paths {
+			if strings.Contains(strings.ReplaceAll(command, paths[0], ""), path) {
+				t.Errorf("command carries %q verbatim:\n%s", path, command)
+			}
+		}
 	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, "", keepLeftover, localProbeRunner(os.Getenv("PATH"))); err == nil {
-		t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path that was never checked")
+	for _, path := range paths {
+		state, err := probeRemoteSocketForm([]string{"host"}, path, localProbeRunner(os.Getenv("PATH")))
+		if err != nil {
+			t.Fatalf("probeRemoteSocketForm(%q) error = %v", path, err)
+		}
+		if state != formAbsent {
+			t.Errorf("probeRemoteSocketForm(%q) = %v, want formAbsent for a path that is not there", path, state)
+		}
+	}
+	if _, err := os.Stat(canary); err == nil {
+		t.Errorf("%s exists: a byte of the path was run as a command", canary)
 	}
 }
 
-// 造一个`sh`的`printf`不解析`\NNN`的`PATH`: 转义文本会存活为`p`的值, 非空,
-// 守卫空解码的检查看不见它, 于是脚本对每个问题都答"no", 路径没被看过就判空闲.
-// 故替身`sh`排在`PATH`最前, 把`printf`定义成原样打印格式串的函数, 再跑探针交来的body.
+// 删除闸门取决于它: 每种路径一个用例, 答案全来自shell自带的测试.
+func TestRemoteSocketFormReportsEachKindOfPath(t *testing.T) {
+	requireShell(t)
+	dir := t.TempDir()
+
+	absent := filepath.Join(dir, "S.gpg-agent")
+	plain := filepath.Join(dir, "plain")
+	if err := os.WriteFile(plain, []byte("not a socket\n"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", plain, err)
+	}
+	sub := filepath.Join(dir, "adir")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatalf("create %s: %v", sub, err)
+	}
+	dead := filepath.Join(dir, "dead")
+	deadSocketAt(t, dead)
+	live := filepath.Join(dir, "live")
+	l := liveSocketAt(t, live)
+	defer l.Close()
+
+	linkToDead := filepath.Join(dir, "link-dead")
+	if err := os.Symlink(dead, linkToDead); err != nil {
+		t.Fatalf("symlink %s: %v", linkToDead, err)
+	}
+	linkToLive := filepath.Join(dir, "link-live")
+	if err := os.Symlink(live, linkToLive); err != nil {
+		t.Fatalf("symlink %s: %v", linkToLive, err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+		want socketForm
+	}{
+		{"a path that is not there", absent, formAbsent},
+		{"a plain file", plain, formNotASocket},
+		{"a directory", sub, formNotASocket},
+		{"a socket nothing listens on", dead, formSocket},
+		{"a live socket", live, formSocket},
+		{"a symbolic link to a dead socket", linkToDead, formSocket},
+		{"a symbolic link to a live socket", linkToLive, formSocket},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := probeRemoteSocketForm([]string{"host"}, tc.path, localProbeRunner(os.Getenv("PATH")))
+			if err != nil {
+				t.Fatalf("probeRemoteSocketForm(%s) error = %v", tc.path, err)
+			}
+			if got != tc.want {
+				t.Errorf("form = %v, want %v for %s", got, tc.want, tc.name)
+			}
+		})
+	}
+}
+
+// 钉住设计所依赖的一点: 形态全来自shell自带的测试, 缺`ss`/`grep`/`sed`等工具的主机
+// 答得和齐全的主机一样好, 不会因缺工具而拒掉会话.
+func TestRemoteSocketFormNeedsNoToolsOnTheRemoteHost(t *testing.T) {
+	requireShell(t)
+	bare := pathWithOnlySh(t)
+	dir := t.TempDir()
+	dead := filepath.Join(dir, "dead")
+	deadSocketAt(t, dead)
+	live := filepath.Join(dir, "live")
+	l := liveSocketAt(t, live)
+	defer l.Close()
+
+	cases := []struct {
+		name string
+		path string
+		want socketForm
+	}{
+		{"a path that is not there", filepath.Join(dir, "nope"), formAbsent},
+		{"a dead socket", dead, formSocket},
+		{"a live socket", live, formSocket},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := probeRemoteSocketForm([]string{"host"}, tc.path, localProbeRunner(bare))
+			if err != nil {
+				t.Fatalf("probeRemoteSocketForm() error = %v: the form command shelled out to something", err)
+			}
+			if got != tc.want {
+				t.Errorf("form = %v, want %v for %s on a host with no tools", got, tc.want, tc.name)
+			}
+		})
+	}
+}
+
+// 连socket要写权限: 权限被拒在这头就是一条结束的连接, 与无人监听无法区分,
+// 故先在主机上正面验证权限. root会绕过它, 故不跳过(跳过就什么都防不住),
+// 改用普通用户跑, 让每个能表达该条件的主机都真的过一遍闸门.
+func TestRemoteSocketFormReportsAnUnwritablePath(t *testing.T) {
+	requireShell(t)
+	pid := strconv.Itoa(os.Getpid())
+	// 不用`t.TempDir`: 它的父目录是0700, 换成普通用户跑的命令进不去.
+	dir, err := os.MkdirTemp("/tmp", "gpg-agent-forward-unwritable-")
+	if err != nil {
+		t.Fatalf("make a directory to hold the socket: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod the directory: %v", err)
+	}
+	path := filepath.Join(dir, "S.gpg-agent-"+pid)
+	l := liveSocketAt(t, path)
+	defer l.Close()
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatalf("chmod the socket: %v", err)
+	}
+
+	run := localProbeRunner(os.Getenv("PATH"))
+	if os.Geteuid() == 0 {
+		unprivileged, err := runAsUnprivileged()
+		if err != nil {
+			t.Skipf("running as root and no unprivileged user to run the command as: %v", err)
+		}
+		run = unprivileged
+		if canWriteAs(run, path) {
+			t.Fatalf("the command can write %s, so this test cannot express an unwritable path", path)
+		}
+	}
+	if canWriteAs(run, path) {
+		t.Fatalf("the command can write %s, so this test cannot express an unwritable path", path)
+	}
+	// 试金石: 路径必须对运行者可见, 否则形态命令只会答"不存在", 到不了写闸门.
+	if form, err := probeRemoteSocketForm([]string{"host"}, path, run); err != nil || form == formAbsent {
+		t.Fatalf("the runner cannot see %s (%v, %v), so this test would not reach the write gate", path, form, err)
+	}
+
+	got, err := probeRemoteSocketForm([]string{"host"}, path, run)
+	if err != nil {
+		t.Fatalf("probeRemoteSocketForm() error = %v", err)
+	}
+	if got != formUnwritable {
+		t.Errorf("form = %v, want formUnwritable for a socket this user cannot write", got)
+	}
+
+	// 试金石: 没有写闸门, 这就是会删掉在用agent socket的那个例子.
+	state, err := CheckRemoteSocketFree([]string{"host"}, path, run)
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a path this user cannot write")
+	}
+	if state != socketUnjudgeable {
+		t.Errorf("state = %v, want socketUnjudgeable", state)
+	}
+	if !socketFileExists(t, path) {
+		t.Fatal("a live socket in a path this user cannot write was removed")
+	}
+}
+
+// 测试进程是root时写权限会被绕过, 故以普通用户身份跑远端命令.
+func runAsUnprivileged() (SSHCommandRunner, error) {
+	su, err := exec.LookPath("su")
+	if err != nil {
+		return nil, err
+	}
+	for _, user := range []string{"nobody", "daemon", "bin"} {
+		if err := exec.Command(su, "-s", "/bin/sh", user, "-c", "true").Run(); err != nil {
+			continue
+		}
+		u := user
+		return func(_ []string, remoteCommand string) (string, error) {
+			cmd := exec.Command(su, "-s", "/bin/sh", u, "-c", remoteCommand)
+			cmd.Env = envWithPath(os.Getenv("PATH"))
+			out, err := cmd.Output()
+			return string(out), err
+		}, nil
+	}
+	return nil, errors.New("no unprivileged user is reachable through su")
+}
+
+// 让测试确认自己真搭出了要考的条件.
+func canWriteAs(run SSHCommandRunner, path string) bool {
+	out, err := run(nil, "if [ -w "+shellQuoteSingle(path)+" ]; then echo yes; else echo no; fi")
+	return err == nil && strings.Contains(out, "yes")
+}
+
+// 编码的fail-open面: `printf`不读`\NNN`时, 转义文本本身成了`p`的值, 非空,
+// 空解码的守卫看不见它, 脚本的每个问题都答"no". "不存在"是唯一能放行会话和删除
+// 的答案, 故绝不能由坏解码产生 - 先证明解码可信, 再信它.
+func TestRemoteSocketFormRefusesADecodeItCannotTrust(t *testing.T) {
+	requireShell(t)
+	path := filepath.Join(t.TempDir(), "S.gpg-agent")
+
+	// 试金石: 同一路径在会解码的主机上得到"不存在"的正常结论, 坏解码绝不能造出它.
+	if form, err := probeRemoteSocketForm([]string{"host"}, path, localProbeRunner(os.Getenv("PATH"))); err != nil || form != formAbsent {
+		t.Fatalf("probeRemoteSocketForm() on a host that decodes = (%v, %v), want (formAbsent, nil)", form, err)
+	}
+
+	run := localProbeRunner(pathWithNonDecodingPrintf(t, os.Getenv("PATH")))
+	form, err := probeRemoteSocketForm([]string{"host"}, path, run)
+	if err != nil {
+		t.Fatalf("probeRemoteSocketForm() error = %v", err)
+	}
+	if form == formAbsent {
+		t.Fatalf("form = %v, want anything but absent: the path was never decoded, so nothing about it was checked", form)
+	}
+	if form != formUnknown {
+		t.Errorf("form = %v, want formUnknown for a host whose printf cannot decode the path", form)
+	}
+
+	// 拒绝会给出越过它的办法: 主机可达, 路径也许真空着, 是否硬启由用户权衡.
+	_, err = CheckRemoteSocketFree([]string{"host"}, path, run)
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the decode cannot be trusted")
+	}
+	if !strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
+	}
+}
+
+// 造一个`sh`的`printf`不解析`\NNN`的`PATH`: POSIX要求`printf`读`\NNN`,
+// 不读的实现会原样印出转义文本. 没有主机能按需长成这样, 故造在命令找`sh`的地方:
+// 排在`PATH`最前的替身`sh`, 把`printf`定义成原样打印格式串的函数, 再跑交来的body.
 func pathWithNonDecodingPrintf(t *testing.T, base string) string {
 	t.Helper()
 	real, err := exec.LookPath("sh")
@@ -266,865 +486,697 @@ func pathWithNonDecodingPrintf(t *testing.T, base string) string {
 	return dir + string(os.PathListSeparator) + base
 }
 
-// 编码的fail-open面: `printf`不读`\NNN`时, 转义文本本身成了`p`的值, 非空,
-// 空解码的守卫看不见它, 脚本的每个问题都答"no" - "不存在"是能让会话在没查过的
-// 路径上开跑的答案, 绝不能由坏解码造出; 故先证明解码可信.
-func TestRemoteSocketProbeRefusesADecodeItCannotTrust(t *testing.T) {
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-
-	// 试金石: 同一路径在会解码的主机上得到"不存在"的正常结论, 坏解码绝不能造出它.
-	if state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(os.Getenv("PATH"))); err != nil || state != socketFree {
-		t.Fatalf("probeRemoteSocket() on a host that decodes = (%v, %v), want (socketFree, nil): this test needs the absent verdict to be the one a failed decode would give", state, err)
-	}
-
-	run := localProbeRunner(pathWithNonDecodingPrintf(t, os.Getenv("PATH")))
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, run)
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state == socketFree || state == socketReclaimed {
-		t.Fatalf("state = %v, want neither a free path nor a removal: the path was never decoded, so nothing about it was checked", state)
-	}
-	if state != socketUnjudgeable {
-		t.Errorf("state = %v, want socketUnjudgeable for a host whose printf cannot decode the path", state)
-	}
-	// 拒绝必须带上越过它的办法: 主机可达, 路径也许真空着, 是否硬启由用户权衡.
-	_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, run)
-	if err == nil {
-		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the decode cannot be trusted")
-	}
-	if !strings.Contains(err.Error(), "--skip-remote-check") {
-		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
-	}
-}
-
 // 上面检查的另一面: 问题出在主机的`printf`, 不在路径. 反斜杠是合法字节,
 // 一刀切拒绝会让本可解码的路径全变成"unknown".
-func TestRemoteSocketProbeJudgesAPathWithABackslash(t *testing.T) {
+func TestRemoteSocketFormJudgesAPathWithABackslash(t *testing.T) {
 	requireShell(t)
 	dir := filepath.Join(t.TempDir(), `back\slash`)
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatalf("create %s: %v", dir, err)
 	}
 	path := filepath.Join(dir, "S.gpg-agent")
-	run := localProbeRunner(ssPathForProbe(t))
+	run := localProbeRunner(os.Getenv("PATH"))
 
 	deadSocketAt(t, path)
-	state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, run)
+	form, err := probeRemoteSocketForm([]string{"host"}, path, run)
 	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
+		t.Fatalf("probeRemoteSocketForm() error = %v", err)
 	}
-	if state != socketReclaimed {
-		t.Fatalf("state = %v, want socketReclaimed: a path with a backslash in it is decoded and judged like any other", state)
-	}
-	if socketFileExists(t, path) {
-		t.Errorf("%s is still there: the leftover was not the file the decode produced", path)
+	if form != formSocket {
+		t.Fatalf("form = %v, want formSocket: a path with a backslash in it is decoded and judged like any other", form)
 	}
 
-	l := listenAt(t, path)
-	defer l.Close()
-	state, err = probeRemoteSocket([]string{"host"}, path, keepLeftover, run)
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
+	// 死socket的文件已被换成活的: 监听者必须是新文件, 不是上一个用例的遗留.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove %s: %v", path, err)
 	}
-	if state != socketLive {
-		t.Errorf("state = %v, want socketLive for a listener at a path with a backslash in it", state)
+	l := liveSocketAt(t, path)
+	defer l.Close()
+	form, err = probeRemoteSocketForm([]string{"host"}, path, run)
+	if err != nil {
+		t.Fatalf("probeRemoteSocketForm() error = %v", err)
+	}
+	if form != formSocket {
+		t.Errorf("form = %v, want formSocket for a listener at a path with a backslash in it", form)
+	}
+}
+
+func TestRemoteSocketRemoveReportsWhatHappened(t *testing.T) {
+	requireShell(t)
+	run := localProbeRunner(os.Getenv("PATH"))
+
+	t.Run("a leftover is removed", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "S.gpg-agent")
+		deadSocketAt(t, path)
+		removed, err := removeRemoteSocket([]string{"host"}, path, run)
+		if err != nil {
+			t.Fatalf("removeRemoteSocket() error = %v", err)
+		}
+		if !removed {
+			t.Error("removeRemoteSocket() = false, want the leftover reported as removed")
+		}
+		if socketFileExists(t, path) {
+			t.Errorf("%s is still there: a dead socket blocks the next session's bind", path)
+		}
+	})
+
+	t.Run("a path that cannot be unlinked is not reported as removed", func(t *testing.T) {
+		// 删除失败都长这样(目录没有`-r`删不掉): 答"no", 调用方把"yes"当作开跑许可.
+		path := filepath.Join(t.TempDir(), "adir")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("create %s: %v", path, err)
+		}
+		removed, err := removeRemoteSocket([]string{"host"}, path, run)
+		if err != nil {
+			t.Fatalf("removeRemoteSocket() error = %v", err)
+		}
+		if removed {
+			t.Error("removeRemoteSocket() = true for a path that is still there")
+		}
+		if !socketFileExists(t, path) {
+			t.Error("the directory is gone, so this case no longer tests what it means to")
+		}
+	})
+
+	t.Run("a path that can never be decoded is not reported as removed", func(t *testing.T) {
+		bad := pathWithNonDecodingPrintf(t, os.Getenv("PATH"))
+		removed, err := removeRemoteSocket([]string{"host"}, "/tmp/whatever", localProbeRunner(bad))
+		if err != nil {
+			t.Fatalf("removeRemoteSocket() error = %v", err)
+		}
+		if removed {
+			t.Error("removeRemoteSocket() = true for a host whose printf cannot decode the path")
+		}
+	})
+
+	t.Run("a host that answered nothing is not reported as removed", func(t *testing.T) {
+		// 完全没有结论行说明命令没照原样跑起来: 文件还在不在都不知道, 只能读作没删成.
+		run := func([]string, string) (string, error) { return "Welcome to the host\n", nil }
+		removed, err := removeRemoteSocket([]string{"host"}, "/tmp/whatever", run)
+		if err != nil {
+			t.Fatalf("removeRemoteSocket() error = %v", err)
+		}
+		if removed {
+			t.Error("removeRemoteSocket() = true when the host reported nothing")
+		}
+	})
+}
+
+const (
+	// 标记重执行的替身进程.
+	forwardHelperEnv = "GPG_AGENT_FORWARD_TEST_FORWARD_SSH"
+	// 替身`ssh`把参数向量写进的文件, 免得helper去解析自己的命令行.
+	forwardArgsEnv = "GPG_AGENT_FORWARD_TEST_FORWARD_ARGS"
+	// 让替身像转发被拒的`ssh`那样失败: 退出非零, 且从不发布本地端口.
+	forwardRefuseEnv = "GPG_AGENT_FORWARD_TEST_FORWARD_REFUSE"
+	// 让替身只发布目标端口, 不发布控制端口: 只缺控制的那种连接的形态.
+	forwardNoControlEnv = "GPG_AGENT_FORWARD_TEST_FORWARD_NO_CONTROL"
+)
+
+// 不是独立的测试: 是分类的远端, 以替身`ssh`重新执行, 做`ssh`与`sshd`
+// 对检查所建三个forward该做的事. 路径都在本机, "远端"与"本机"是同一台,
+// 连接结果因此可观测: `classifyRemoteSocket`拨这个helper发布的端口看连接怎么走.
+func TestForwardSSHHelper(t *testing.T) {
+	if os.Getenv(forwardHelperEnv) == "" {
+		t.Skip("not the stand-in ssh invocation")
+	}
+	if os.Getenv(forwardRefuseEnv) != "" {
+		// 拒绝转发的`sshd`的产物: 没有本地端口, 且以失败退出; 检查的对照会发现.
+		fmt.Fprintln(os.Stderr, "channel 1: open failed: connect failed: open failed")
+		os.Exit(255)
+	}
+	data, err := os.ReadFile(os.Getenv(forwardArgsEnv))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stand-in ssh: %v\n", err)
+		os.Exit(1)
+	}
+	if err := runForwardStandIn(strings.Split(strings.TrimRight(string(data), "\n"), "\n")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(255)
+	}
+	// 挂住forward直到检查杀掉本进程, 这正是`ssh`的行为: `-N`表示会话只有forward.
+	select {}
+}
+
+// 绑定一组参数里的forward并服务到进程被杀: `ssh`对纯forward会话也如此.
+func runForwardStandIn(args []string) error {
+	noControl := os.Getenv(forwardNoControlEnv) != ""
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-R":
+			// `-R PATH:127.0.0.1:PORT`: 绑路径, 转发到端口.
+			if i+1 >= len(args) {
+				return fmt.Errorf("stand-in ssh: -R without a value")
+			}
+			parts := strings.SplitN(unescapePercent(args[i+1]), ":", 3)
+			if len(parts) != 3 {
+				return fmt.Errorf("stand-in ssh: bad -R spec %q", args[i+1])
+			}
+			path, host, portStr := parts[0], parts[1], parts[2]
+			// `sshd`在`StreamLocalBindUnlink`开着时绑定前会先unlink已有socket;
+			// 这里模拟的就是它, 也正因此检查的对照路径必须无人使用.
+			_ = os.Remove(path)
+			l, err := net.Listen("unix", path)
+			if err != nil {
+				return fmt.Errorf("stand-in ssh: bind %s: %w", path, err)
+			}
+			go forwardEach(l, "tcp", host+":"+portStr)
+			i++
+		case "-L":
+			// `-L 127.0.0.1:PORT:PATH`: 绑端口, 连到该路径.
+			if i+1 >= len(args) {
+				return fmt.Errorf("stand-in ssh: -L without a value")
+			}
+			parts := strings.SplitN(unescapePercent(args[i+1]), ":", 3)
+			if len(parts) != 3 {
+				return fmt.Errorf("stand-in ssh: bad -L spec %q", args[i+1])
+			}
+			host, portStr, path := parts[0], parts[1], parts[2]
+			if noControl && strings.Contains(path, controlSocketPrefix) {
+				// 对照端口刻意从不发布.
+				i++
+				continue
+			}
+			l, err := net.Listen("tcp", host+":"+portStr)
+			if err != nil {
+				// `ExitOnForwardFailure`开着时`ssh`就打出这句并退出: 检查读成"无法判断".
+				return fmt.Errorf("Could not request local forwarding: %w", err)
+			}
+			go forwardEach(l, "unix", path)
+			i++
+		}
+	}
+	// 监听者各由自己的goroutine挂住, 随进程存活: 本函数停在末尾不返回,
+	// 直到检查杀掉本进程.
+	select {}
+}
+
+// 还原检查在forward规格里对路径的转义, 让替身服务被问到的路径.
+func unescapePercent(s string) string { return strings.ReplaceAll(s, "%%", "%") }
+
+// 在l上accept, 每个连接连到给定地址并双向复制到任一端关闭.
+// 远端连不上就立即关闭, 同`sshd`: 调用方看到的是一次结束, 不是拒绝.
+func forwardEach(l net.Listener, network, addr string) {
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			peer, err := net.Dial(network, addr)
+			if err != nil {
+				return
+			}
+			defer peer.Close()
+			done := make(chan struct{}, 2)
+			go func() { _, _ = io.Copy(peer, c); done <- struct{}{} }()
+			go func() { _, _ = io.Copy(c, peer); done <- struct{}{} }()
+			<-done
+		}(c)
+	}
+}
+
+// 写一个替身`ssh`: 对检查的两种连接形态都像远端主机, 返回找到它的`PATH`; 带`-N`的连接是分类,
+// 参数向量写进文件, 由helper进程服务forward; 其他连接最后一个参数是远端命令, 用`sh`跑,
+// 覆盖一次性form命令与删除. 参数走文件而非helper命令行: 它就是本测试二进制, 其flag解析器管着参数.
+func forwardStandInSSH(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	self := selfExe()
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	script := "#!/bin/sh\n" +
+		"has_n=0\n" +
+		"for a in \"$@\"; do [ \"$a\" = \"-N\" ] && has_n=1; done\n" +
+		"if [ \"$has_n\" = \"1\" ]; then\n" +
+		"  printf '%s\\n' \"$@\" > " + shellQuoteSingle(argsFile) + "\n" +
+		"  exec " + shellQuoteSingle(self) + " -test.run=^TestForwardSSHHelper$\n" +
+		"fi\n" +
+		// 远端命令是最后一个参数, `ssh`就是这么放的.
+		"for last in \"$@\"; do :; done\n" +
+		"exec sh -c \"$last\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write the stand-in ssh: %v", err)
+	}
+	t.Setenv(forwardHelperEnv, "1")
+	t.Setenv(forwardArgsEnv, argsFile)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir
+}
+
+// 用替身`ssh`在本机的路径上跑真正的分类.
+func classifyWithForwardStandIn(t *testing.T, path string) (socketForwardVerdict, error) {
+	t.Helper()
+	forwardStandInSSH(t)
+	control, err := controlSocketPath(path)
+	if err != nil {
+		t.Fatalf("controlSocketPath(%s) error = %v", path, err)
+	}
+	return classifyRemoteSocket([]string{"host"}, path, control)
+}
+
+// 绝不能走到删除的一例: 接受连接却什么都不说的监听者.
+func TestClassifyRemoteSocketSeesALiveListener(t *testing.T) {
+	requireShell(t)
+	path := filepath.Join(shortTempDir(t), "S.gpg-agent")
+	l := liveSocketAt(t, path)
+	defer l.Close()
+
+	verdict, err := classifyWithForwardStandIn(t, path)
+	if err != nil {
+		t.Fatalf("classifyRemoteSocket() error = %v", err)
+	}
+	if verdict != forwardLive {
+		t.Fatalf("verdict = %v, want forwardLive for a listener that accepts and stays silent", verdict)
 	}
 	if !socketFileExists(t, path) {
 		t.Error("a live socket was removed")
 	}
 }
 
-func TestRemoteSocketProbeSeesAnAbsentPath(t *testing.T) {
+// 删除只为此一例.
+func TestClassifyRemoteSocketSeesALeftover(t *testing.T) {
 	requireShell(t)
-	dir := t.TempDir()
-	path := filepath.Join(dir, "S.gpg-agent")
-
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(os.Getenv("PATH")))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state != socketFree {
-		t.Fatalf("state = %v, want socketFree for a path that is not there", state)
-	}
-	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
-		t.Errorf("the probe left %v behind at a path that did not exist: %v", entries, err)
-	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(os.Getenv("PATH"))); err != nil {
-		t.Errorf("CheckRemoteSocketFree() error = %v, want the session to start", err)
-	}
-}
-
-// 只放`sh`和点名的工具: 没有shell命令根本跑不起来, 到不了想测的分支;
-// 少放一个`grep`/`sed`就是在测没有它的主机.
-func pathWithoutSS(t *testing.T, extra ...string) string {
-	t.Helper()
-	sh, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skipf("sh is not on PATH: %v", err)
-	}
-	dir := t.TempDir()
-	if err := os.Symlink(sh, filepath.Join(dir, "sh")); err != nil {
-		t.Fatalf("link sh into an otherwise empty PATH: %v", err)
-	}
-	for _, name := range extra {
-		found, err := exec.LookPath(name)
-		if err != nil {
-			t.Skipf("%s is not on PATH to put on the probe's: %v", name, err)
-		}
-		if err := os.Symlink(found, filepath.Join(dir, name)); err != nil {
-			t.Fatalf("link %s into the probe's PATH: %v", name, err)
-		}
-	}
-	return dir
-}
-
-func TestRemoteSocketProbeReclaimsADeadSocket(t *testing.T) {
-	// 死socket本就该删, 这里显式要它: 这就是`--reclaim-remote-socket`买到的行为.
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
+	path := filepath.Join(shortTempDir(t), "S.gpg-agent")
 	deadSocketAt(t, path)
 
-	state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, localProbeRunner(ssPathForProbe(t)))
+	verdict, err := classifyWithForwardStandIn(t, path)
 	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
+		t.Fatalf("classifyRemoteSocket() error = %v", err)
 	}
-	if state != socketReclaimed {
-		t.Fatalf("state = %v, want socketReclaimed for a socket nothing listens on", state)
-	}
-	if socketFileExists(t, path) {
-		t.Errorf("%s is still there: a dead socket blocks the next session's bind", path)
-	}
-	deadSocketAt(t, path)
-	state, err = CheckRemoteSocketFree([]string{"host"}, path, reclaimLeftover, localProbeRunner(ssPathForProbe(t)))
-	if err != nil || state != socketReclaimed {
-		t.Errorf("CheckRemoteSocketFree() = (%v, %v), want (socketReclaimed, nil)", state, err)
+	if verdict != forwardDead {
+		t.Errorf("verdict = %v, want forwardDead for a socket nothing is listening on", verdict)
 	}
 }
 
-func TestRemoteSocketProbeLeavesALeftoverSocketInPlace(t *testing.T) {
-	// 不用开关: 死socket只报告不删除. 两张表只覆盖一个网络命名空间,
-	// 共享目录的容器里的agent两张表都看不到, 同样的证据会误删在用的socket.
-	// 分不清两者就一律拒绝, 并把推翻此判断的途径交给调用方.
+// 覆盖答不上来但不是残留的路径.
+// 它们由form命令在分类之前分辨: 这里钉住的是分类本身会判它们死,
+// 这正是form命令必须先跑的原因.
+func TestClassifyRemoteSocketSeesNoListenerBehindWhatIsNotASocket(t *testing.T) {
 	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	deadSocketAt(t, path)
-
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
+	dir := shortTempDir(t)
+	plain := filepath.Join(dir, "plain")
+	if err := os.WriteFile(plain, []byte("data\n"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", plain, err)
 	}
-	if state != socketStale {
-		t.Fatalf("state = %v, want socketStale for a socket nothing listens on and no permission to remove it", state)
-	}
-	if !socketFileExists(t, path) {
-		t.Fatalf("%s was removed without --reclaim-remote-socket", path)
-	}
-	// 拒绝必须可操作: 点名开关, 并带上能在远端删掉这个文件的命令.
-	_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
-	if err == nil {
-		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a socket left behind")
-	}
-	if !strings.Contains(err.Error(), "--reclaim-remote-socket") {
-		t.Errorf("error %v should name --reclaim-remote-socket", err)
-	}
-	if want := "rm -f -- " + shellQuoteSingle(path); !strings.Contains(err.Error(), want) {
-		t.Errorf("error %v should carry %q, a command the user can paste on the remote host", err, want)
-	}
-	if !socketFileExists(t, path) {
-		t.Errorf("%s was removed by the refusal path", path)
-	}
-}
-
-// 查命令形状而非行为: 缺陷在行为上看不见 - 路径以`printf`编码出行, 从不以自身出现.
-// `csh`/`tcsh`连单引号里也做历史展开, 路径里的`!`会让命令当场结束;
-// 加引号救不了: `$`, `~`和反引号同样被特殊对待, 且都是合法路径字节, 唯一出路是在脚本内解码.
-func TestRemoteSocketProbeNeverPutsThePathOnTheCommandLine(t *testing.T) {
-	requireShell(t)
-	canary := filepath.Join(t.TempDir(), "canary")
-	paths := []string{
-		"/run/user/1000/gnupg!bang/S.gpg-agent",
-		"/run/user/1000/gnupg%h/S.gpg-agent",
-		"/run/user/1000/it's/S.gpg-agent",
-		"/run/user/1000/with space/S.gpg-agent",
-		"/run/user/1000/`id`/$HOME/S.gpg-agent",
-		"/run/user/1000/back\\slash/S.gpg-agent",
-		"/run/user/1000/gnupg-\xe4\xbb\xa3\xe7\x90\x86/S.gpg-agent",
-		"/run/user/1000/x';touch " + canary + ";'/S.gpg-agent",
-	}
-	for _, path := range paths {
-		if cmd := remoteSocketProbe(path, keepLeftover); strings.Contains(cmd, path) {
-			t.Errorf("the probe command carries %q verbatim:\n%s", path, cmd)
-		}
-		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(os.Getenv("PATH")))
-		if err != nil {
-			t.Fatalf("probeRemoteSocket(%q) error = %v", path, err)
-		}
-		if state != socketFree {
-			t.Errorf("probeRemoteSocket(%q) = %v, want socketFree for a path that is not there", path, state)
-		}
-	}
-	if _, err := os.Stat(canary); err == nil {
-		t.Errorf("%s exists: a byte of the path was run as a command", canary)
-	}
-}
-
-// 同一文件的各种写法: 探针得先认出它们, 才敢说路径上的东西是自己的遗留.
-// 逐个手写而非用`filepath.Join`, 因为它正好会把这些组件清掉.
-var pathSpellings = []struct {
-	name  string
-	other func(t *testing.T, path string) string
-}{
-	{"a symbolic link to the directory", func(t *testing.T, path string) string {
-		t.Helper()
-		dir := filepath.Dir(path)
-		link := filepath.Join(t.TempDir(), "dir-link")
-		if err := os.Symlink(dir, link); err != nil {
-			t.Fatalf("symlink %s: %v", link, err)
-		}
-		return link + "/" + filepath.Base(path)
-	}},
-	{"a component that goes up and comes back down", func(t *testing.T, path string) string {
-		t.Helper()
-		dir := filepath.Dir(path)
-		return dir + "/../" + filepath.Base(dir) + "/" + filepath.Base(path)
-	}},
-	{"a doubled separator", func(t *testing.T, path string) string {
-		t.Helper()
-		return filepath.Dir(path) + "//" + filepath.Base(path)
-	}},
-}
-
-// 钉住唯一会改远端的那条命令的形状, 行为测试看不见它: 两种拼写当时指向同一文件.
-// 但检查与删除之间目录组件可能被改指向, 按输入的拼写删就会落到表从没问过的
-// 文件上 - 授权删除的证据是针对解析后拼写收集的, 故删除只写`np`.
-func TestRemoteSocketProbeRemovesOnlyTheResolvedSpelling(t *testing.T) {
-	const path = "/run/user/1000/gnupg/S.gpg-agent"
-
-	keeping := remoteSocketProbe(path, keepLeftover)
-	if strings.Contains(keeping, "rm ") {
-		t.Errorf("the probe removes something even though the caller kept the leftover:\n%s", keeping)
-	}
-
-	reclaiming := remoteSocketProbe(path, reclaimLeftover)
-	if want := `rm -f -- "$np"`; !strings.Contains(reclaiming, want) {
-		t.Errorf("the reclaiming probe does not carry %q:\n%s", want, reclaiming)
-	}
-	if strings.Contains(reclaiming, `rm -f -- "$p"`) {
-		t.Errorf("the reclaiming probe removes the spelling the user typed rather than the resolved one:\n%s", reclaiming)
-	}
-}
-
-func TestRemoteSocketProbeFindsALiveSocketWrittenAnotherWay(t *testing.T) {
-	// 内核记的是监听者绑定时用的拼写: 符号链接, ..组件或双斜杠到达的socket也一样.
-	// 只按用户输入的拼写匹配, 两张表都会对这个路径沉默, 而沉默正是授权删除的条件,
-	// 转发就会删掉一个在用socket. 这里故意允许删除正是在测这种情况, socket必须活下来.
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	l := listenAt(t, path)
-	defer l.Close()
-	run := localProbeRunner(ssPathForProbe(t))
-
-	for _, tc := range pathSpellings {
-		t.Run(tc.name, func(t *testing.T) {
-			spelling := tc.other(t, path)
-			state, err := probeRemoteSocket([]string{"host"}, spelling, reclaimLeftover, run)
-			if err != nil {
-				t.Fatalf("probeRemoteSocket() error = %v", err)
-			}
-			if state != socketLive {
-				t.Fatalf("state = %v, want socketLive: %s names the socket at %s", state, spelling, path)
-			}
-			if !socketFileExists(t, path) {
-				t.Fatalf("%s was removed while something was listening on it", path)
-			}
-			c, err := net.Dial("unix", path)
-			if err != nil {
-				t.Errorf("the listener no longer accepts connections: %v", err)
-			} else {
-				c.Close()
-			}
-			if _, err := CheckRemoteSocketFree([]string{"host"}, spelling, reclaimLeftover, run); err == nil {
-				t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
-			}
-		})
-	}
-}
-
-func TestRemoteSocketProbeReclaimsALeftoverWrittenAnotherWay(t *testing.T) {
-	// 同一枚硬币的另一面: 允许删除时, 死socket无论用户怎么写路径都会被删,
-	// 删的是两张表被问到的那个文件, 不是它的另一个名字.
-	requireShell(t)
-	run := localProbeRunner(ssPathForProbe(t))
-
-	for _, tc := range pathSpellings {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "S.gpg-agent")
-			deadSocketAt(t, path)
-			spelling := tc.other(t, path)
-
-			state, err := probeRemoteSocket([]string{"host"}, spelling, reclaimLeftover, run)
-			if err != nil {
-				t.Fatalf("probeRemoteSocket() error = %v", err)
-			}
-			if state != socketReclaimed {
-				t.Fatalf("state = %v, want socketReclaimed: %s names the leftover at %s", state, spelling, path)
-			}
-			if socketFileExists(t, path) {
-				t.Errorf("%s is still there: a dead socket blocks the next session's bind", path)
-			}
-		})
-	}
-}
-
-// 在`base`前放一个目录, 内有必失败的`readlink`和`realpath`:
-// 主机两样都没有的样子. `base`其余部分不动, 探针的其他工具照常作答:
-// 要的是解析不工作, 不是表读不出.
-func pathWhereResolvingFails(t *testing.T, base string) string {
-	t.Helper()
-	dir := t.TempDir()
-	for _, tool := range []string{"readlink", "realpath"} {
-		script := "#!/bin/sh\nexit 1\n"
-		if err := os.WriteFile(filepath.Join(dir, tool), []byte(script), 0o755); err != nil {
-			t.Fatalf("write a %s that fails: %v", tool, err)
-		}
-	}
-	return dir + string(os.PathListSeparator) + base
-}
-
-func TestRemoteSocketProbeLeavesWhatItCannotResolveAlone(t *testing.T) {
-	// 删除按解析后的拼写授权: 解析做不了的主机没有回答删除依赖的问题.
-	// 无论调用方允许什么都不删, 拒绝时说解析失败, 而不是说表读得好好的.
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	deadSocketAt(t, path)
-	run := localProbeRunner(pathWhereResolvingFails(t, ssPathForProbe(t)))
-
-	state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, run)
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state != socketUnresolved {
-		t.Fatalf("state = %v, want socketUnresolved when the path cannot be resolved", state)
-	}
-	if !socketFileExists(t, path) {
-		t.Error("the probe removed a socket whose resolved spelling it never checked")
-	}
-	_, err = CheckRemoteSocketFree([]string{"host"}, path, reclaimLeftover, run)
-	if err == nil {
-		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the path cannot be resolved")
-	}
-	if !strings.Contains(err.Error(), "readlink") {
-		t.Errorf("error %v should name the resolution as what failed", err)
-	}
-	if strings.Contains(err.Error(), "/proc/net/unix") {
-		t.Errorf("error %v should not blame the kernel's socket table, which was read fine", err)
-	}
-}
-
-func TestRemoteSocketProbeLeavesALiveSocketAlone(t *testing.T) {
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	l := listenAt(t, path)
-	defer l.Close()
-
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state != socketLive {
-		t.Fatalf("state = %v, want socketLive for a socket something listens on", state)
-	}
-	if !socketFileExists(t, path) {
-		t.Fatalf("%s was removed while something was listening on it", path)
-	}
-	c, err := net.Dial("unix", path)
-	if err != nil {
-		t.Errorf("the listener no longer accepts connections: %v", err)
-	} else {
-		c.Close()
-	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t))); err == nil {
-		t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
-	}
-}
-
-func TestRemoteSocketProbeLeavesAPlainFileAlone(t *testing.T) {
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	const content = "not a socket\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state != socketNotASocket {
-		t.Fatalf("state = %v, want socketNotASocket for a plain file", state)
-	}
-	got, err := os.ReadFile(path)
-	if err != nil || string(got) != content {
-		t.Errorf("%s now holds %q (%v), want it untouched", path, got, err)
-	}
-}
-
-func TestRemoteSocketProbeReportsASymlinkAsUndecidable(t *testing.T) {
-	requireShell(t)
-	dir := t.TempDir()
-	target := filepath.Join(dir, "real-S.gpg-agent")
-	l := listenAt(t, target)
-	defer l.Close()
-	path := filepath.Join(dir, "S.gpg-agent")
-	if err := os.Symlink(target, path); err != nil {
-		t.Fatalf("symlink %s: %v", path, err)
-	}
-
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state == socketReclaimed || state == socketLive {
-		t.Fatalf("state = %v, want neither a removal nor a live verdict for a symbolic link", state)
-	}
-	fi, err := os.Lstat(path)
-	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("%s is no longer the symbolic link it was: %v, %v", path, fi, err)
-	}
-	if !socketFileExists(t, target) {
-		t.Errorf("the listener's own socket at %s was removed", target)
-	}
-	// 错误必须说真正的原因: 怪到`ss`头上会让用户查错方向.
-	_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
-	if err == nil {
-		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a symbolic link")
-	}
-	if !strings.Contains(err.Error(), "symbolic link") {
-		t.Errorf("error %v should say the path is a symbolic link", err)
-	}
-	if strings.Contains(err.Error(), "ss") {
-		t.Errorf("error %v should not blame ss for a link it was never asked about", err)
-	}
-}
-
-func TestRemoteSocketProbeIsUndecidedWithoutSS(t *testing.T) {
-	// 没有`ss`的主机不能授权删除: 内核表只能说有socket绑在该路径, 只有`ss`
-	// 能证明无人监听它, 所以无人听的socket留在原地, 调用方被告知主机答不了.
-	// 读表工具与`sh`一起放进`PATH`, 判定针对缺`ss`, 不是第二个读不出的来源.
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	deadSocketAt(t, path)
-
-	noSS := pathWithoutSS(t, "grep", "sed")
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(noSS))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state != socketUnjudgeable {
-		t.Fatalf("state = %v, want socketUnjudgeable where ss cannot be found", state)
-	}
-	if !socketFileExists(t, path) {
-		t.Errorf("%s was removed by a probe that could not tell what it was", path)
-	}
-}
-
-func TestRemoteSocketProbeNamesALiveSocketWithoutSS(t *testing.T) {
-	// 内核表不依赖`ss`也能点出活着的agent: 否则只会报"could not tell",
-	// 而该判定给出的`--skip-remote-check`会让sshd顶掉远端agent.
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	l := listenAt(t, path)
-	defer l.Close()
-
-	noSS := pathWithoutSS(t, "grep", "sed")
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(noSS))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state != socketLive {
-		t.Fatalf("state = %v, want socketLive: the kernel table lists %s on a host that has no ss", state, path)
-	}
-	if !socketFileExists(t, path) {
-		t.Fatal("a live socket was removed on a host whose probe never mentioned it")
-	}
-	_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(noSS))
-	if err == nil {
-		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
-	}
-	if !strings.Contains(err.Error(), "in use") {
-		t.Errorf("error %v should say the path is in use rather than that the host could not be checked", err)
-	}
-}
-
-func TestRemoteSocketProbeDoesNotRemoveWhenSSFails(t *testing.T) {
-	// `ss`失败时输出为空, 而管道报的是管道里最后一条命令的状态, 不是`ss`的:
-	// 空输出不等于"无人监听", 要先看`ss`自己的退出码; 来源少一个就什么都不许删.
-	requireShell(t)
-	ssPath := brokenSSStub(t)
-
-	t.Run("a live socket survives, and is still named as live", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		l := listenAt(t, path)
-		defer l.Close()
-
-		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath))
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		// 内核表不因`ss`坏掉而失灵: 路径被占用就准确报出, 不是含糊其辞.
-		if state != socketLive {
-			t.Fatalf("state = %v, want socketLive: the kernel table lists the listener whatever ss does", state)
-		}
-		if !socketFileExists(t, path) {
-			t.Fatal("the probe removed a live socket because a broken ss printed nothing")
-		}
-		c, err := net.Dial("unix", path)
-		if err != nil {
-			t.Errorf("the listener no longer accepts connections: %v", err)
-		} else {
-			c.Close()
-		}
-		if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath)); err == nil {
-			t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path that is in use")
-		}
-	})
-
-	t.Run("a dead socket is left in place", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		deadSocketAt(t, path)
-
-		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath))
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketUnjudgeable {
-			t.Fatalf("state = %v, want socketUnjudgeable when ss fails", state)
-		}
-		if !socketFileExists(t, path) {
-			t.Error("the probe removed a socket on the word of an ss that never answered")
-		}
-	})
-}
-
-func TestRemoteSocketProbeTellsUnknownWhenSSPrintsNothing(t *testing.T) {
-	// `ss`干净退出但什么都没打印, 不等于无人监听, 所以判成无法判断而非可删.
-	requireShell(t)
-	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	deadSocketAt(t, path)
-
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssStub(t, "")))
-	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
-	}
-	if state != socketUnjudgeable {
-		t.Fatalf("state = %v, want socketUnjudgeable when ss prints no table", state)
-	}
-	if !socketFileExists(t, path) {
-		t.Error("the probe removed a socket on an ss that printed nothing")
-	}
-}
-
-// 覆盖单来源的缺陷: `ss`退出0且打印成形的表, 却漏掉真实存在的监听者,
-// 其输出与"无人监听"时诚实的`ss`一模一样, 只看`ss`就会删掉活socket.
-func TestRemoteSocketProbeRefusesToBelieveASingleSource(t *testing.T) {
-	requireShell(t)
-
-	// 替身通过探针对`ss`自身的每项检查(存在, 退出0, 打出表头), 只是从不列出任何东西.
-	lyingSS := ssStub(t, ssHeader)
-
-	t.Run("a live socket is not removed on the word of a lying ss", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		l := listenAt(t, path)
-		defer l.Close()
-
-		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(lyingSS))
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketLive {
-			t.Fatalf("state = %v, want socketLive: the kernel table lists %s whatever ss says", state, path)
-		}
-		if !socketFileExists(t, path) {
-			t.Fatal("the probe removed a live socket on the word of an ss that never listed it")
-		}
-		c, err := net.Dial("unix", path)
-		if err != nil {
-			t.Errorf("the listener no longer accepts connections: %v", err)
-		} else {
-			c.Close()
-		}
-		if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(lyingSS)); err == nil {
-			t.Error("CheckRemoteSocketFree() error = nil, want the live verdict surfaced as a refusal")
-		}
-	})
-
-	t.Run("the same stub is believed when it is the only source left", func(t *testing.T) {
-		// 上一个子测试的牙齿: 单来源探针在这里会走出删除, 上一个子测试在它手里会失败.
-		// 第二来源换成读得到且形如空表的替身, 内核表不再参与, 说谎的`ss`便会删掉活socket.
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		l := listenAt(t, path)
-		defer l.Close()
-
-		run := replaceProbeSource(localProbeRunner(lyingSS), procNetUnixPath, procTableStub(t, procTableHeader+"\n"))
-		state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, run)
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketReclaimed {
-			t.Fatalf("state = %v, want socketReclaimed with ss as the only source that can answer", state)
-		}
-		if socketFileExists(t, path) {
-			t.Error("the socket is still there, so this stub alone does not drive the removal the subtest above guards against")
-		}
-	})
-
-	t.Run("the same stub reclaims a dead socket when both sources omit it", func(t *testing.T) {
-		// 交叉核对不是拒绝清理: 两张表都没列出的socket, 调用方要求的删除照旧执行.
-		// 复用的替身对死socket打印的表与诚实`ss`无异.
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		deadSocketAt(t, path)
-
-		state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, localProbeRunner(lyingSS))
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketReclaimed {
-			t.Fatalf("state = %v, want socketReclaimed when neither source lists the path", state)
-		}
-		if socketFileExists(t, path) {
-			t.Errorf("%s is still there: a dead socket blocks the next session's bind", path)
-		}
-	})
-}
-
-// 第二个来源完全不作答, 与回答"这里没有"不同: 只有一个来源时,
-// 无论它多健康, 都不得删除.
-func TestRemoteSocketProbeIsUndecidedWithoutTheKernelTable(t *testing.T) {
-	requireShell(t)
-
-	t.Run("a live socket survives", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		l := listenAt(t, path)
-		defer l.Close()
-
-		// 空目录里的路径, 对脚本来说就是`/proc/net/unix`未挂载或读不到的样子.
-		run := replaceProbeSource(localProbeRunner(ssStub(t, ssHeader)), procNetUnixPath, missingProcTable(t))
-		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, run)
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketUnjudgeable {
-			t.Fatalf("state = %v, want socketUnjudgeable when the kernel table cannot be read", state)
-		}
-		if !socketFileExists(t, path) {
-			t.Fatal("the probe removed a live socket with only ss to speak for it")
-		}
-		// 拒绝要给出绕过它的路: `/proc/net/unix`被屏蔽的主机, 用户仍可能想用.
-		_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, run)
-		if err == nil {
-			t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal while one source is missing")
-		}
-		if !strings.Contains(err.Error(), "--skip-remote-check") {
-			t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
-		}
-	})
-
-	t.Run("a dead socket is left in place", func(t *testing.T) {
-		// 唯一作答的来源说"这里没有"也还不够: 删除要两个来源都同意.
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		deadSocketAt(t, path)
-
-		run := replaceProbeSource(localProbeRunner(ssPathForProbe(t)), procNetUnixPath, missingProcTable(t))
-		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, run)
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketUnjudgeable {
-			t.Fatalf("state = %v, want socketUnjudgeable when the kernel table cannot be read", state)
-		}
-		if !socketFileExists(t, path) {
-			t.Error("the probe removed a socket with only ss to vouch for it")
-		}
-	})
-}
-
-// 覆盖两个来源对路径拼写不一致的情形: `ss`可以把空格打成`\x20`,
-// 探针按真实拼写做整字段匹配就会漏掉那行; 内核表原样打印路径,
-// 所以监听者仍被找到, socket不会被删.
-func TestRemoteSocketProbeFindsALiveSocketWhosePathSSEscapes(t *testing.T) {
-	requireShell(t)
-	dir := t.TempDir()
-	sub := filepath.Join(dir, "with space")
+	sub := filepath.Join(dir, "adir")
 	if err := os.Mkdir(sub, 0o700); err != nil {
 		t.Fatalf("create %s: %v", sub, err)
 	}
-	path := filepath.Join(sub, "S.gpg-agent")
-	l := listenAt(t, path)
+	for _, path := range []string{plain, sub, filepath.Join(dir, "nope")} {
+		verdict, err := classifyWithForwardStandIn(t, path)
+		if err != nil {
+			t.Fatalf("classifyRemoteSocket(%s) error = %v", path, err)
+		}
+		if verdict != forwardDead {
+			t.Errorf("classifyRemoteSocket(%s) = %v, want forwardDead", path, verdict)
+		}
+	}
+}
+
+// 这个对照存在的原因: `sshd`会拒绝stream-local转发(逐连接可配,
+// 用`AllowStreamLocalForwarding no`或`PermitOpen`限制), 对活socket的拒绝在本端与无人监听无从区分;
+// 没有对照就会授权删掉在用的socket, 有对照则答"无法判断", 什么都不删.
+func TestClassifyRemoteSocketRefusesWhenTheControlIsMissing(t *testing.T) {
+	requireShell(t)
+	path := filepath.Join(shortTempDir(t), "S.gpg-agent")
+	l := liveSocketAt(t, path)
 	defer l.Close()
 
-	// 成形的表, 唯一毛病是路径拼写: `ss`对监听者诚实, 对它的名字不诚实.
-	escaped := strings.ReplaceAll(path, " ", `\x20`)
-	ssPath := ssStub(t, ssHeader+"\nu_str LISTEN 0 4096 "+escaped+" 4242 * 0")
-
-	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath))
+	forwardStandInSSH(t)
+	t.Setenv(forwardNoControlEnv, "1")
+	control, err := controlSocketPath(path)
 	if err != nil {
-		t.Fatalf("probeRemoteSocket() error = %v", err)
+		t.Fatalf("controlSocketPath() error = %v", err)
 	}
-	if state != socketLive {
-		t.Fatalf("state = %v, want socketLive: the kernel table prints %s as it is", state, path)
+
+	verdict, err := classifyRemoteSocket([]string{"host"}, path, control)
+	if verdict != forwardUnjudgeable {
+		t.Fatalf("verdict = %v (error %v), want forwardUnjudgeable: a refusal reads exactly like a leftover at this end", verdict, err)
 	}
 	if !socketFileExists(t, path) {
-		t.Fatal("the probe removed a live socket because ss escaped the space in its path")
-	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath)); err == nil {
-		t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
+		t.Error("a live socket was removed on a connection that could not be told apart from a leftover")
 	}
 }
 
-func TestRemoteSocketProbeMatchesWholeAddressFields(t *testing.T) {
+// 覆盖对照丢失的另一途: `ssh`自己没走够远, 什么都没发布.
+func TestClassifyRemoteSocketRefusesWhenSSHFails(t *testing.T) {
 	requireShell(t)
+	path := filepath.Join(shortTempDir(t), "S.gpg-agent")
+	deadSocketAt(t, path)
 
-	t.Run("a longer path is not this path", func(t *testing.T) {
-		// 默认agent路径是`S.gpg-agent.extra`的前缀: 子串匹配会把死socket认成活,
-		// 让它挡住bind, 而诊断会怪到远端agent头上.
-		dir := t.TempDir()
-		path := filepath.Join(dir, "S.gpg-agent")
-		deadSocketAt(t, path)
-		table := strings.Join([]string{
-			ssHeader,
-			"u_str LISTEN 0 4096 " + path + ".extra 4242 * 0",
-			"u_str LISTEN 0 4096 /tmp/x" + path + "y 4243 * 0",
-		}, "\n")
-
-		state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, localProbeRunner(ssStub(t, table)))
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketReclaimed {
-			t.Fatalf("state = %v, want socketReclaimed: a listening sibling is not this path", state)
-		}
-		if socketFileExists(t, path) {
-			t.Errorf("%s is still there, so the dead socket was read as live", path)
-		}
-	})
-
-	t.Run("a path that ends a line is still this path", func(t *testing.T) {
-		// 地址是这行的最后一个字段, 后面什么都没有: 省掉对端列的表就是这样.
-		path := filepath.Join(t.TempDir(), "S.gpg-agent")
-		l := listenAt(t, path)
-		defer l.Close()
-		table := ssHeader + "\nu_str LISTEN 0 4096 " + path
-
-		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssStub(t, table)))
-		if err != nil {
-			t.Fatalf("probeRemoteSocket() error = %v", err)
-		}
-		if state != socketLive {
-			t.Fatalf("state = %v, want socketLive for the last field of a line", state)
-		}
-		if !socketFileExists(t, path) {
-			t.Error("a live socket was removed because its address ended a line")
-		}
-	})
-}
-
-// 返回内核形状的unix socket表, 内有n个绑定的socket:
-// 用来量探针在socket很多的主机上的开销. 成本在shell处理表的部分,
-// 而表每次调用都要读, 最忙的主机表最大, 所以这部分必须有界.
-func largeSocketTable(n int) string {
-	var b strings.Builder
-	b.WriteString(procTableHeader)
-	b.WriteString("\n")
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&b, "0000000000000000: 00000002 00000000 00010000 0002 01 %8d /run/sockets/socket-%d\n", 100000+i, i)
-	}
-	return b.String()
-}
-
-// 同一台主机在`ss`眼里的样子: 每个socket一行监听记录.
-func largeSSTable(n int) string {
-	var b strings.Builder
-	b.WriteString(ssHeader)
-	b.WriteString("\n")
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&b, "u_str LISTEN 0 4096 /run/sockets/socket-%d 4242 * 0\n", i)
-	}
-	return b.String()
-}
-
-// 搭一台有rows个unix socket和一条无关路径的主机, 返回在那边跑探针的runner.
-// 路径是死socket, 所以探针必须读两张表才能说出任何话.
-func benchProbeOnALargeTable(b *testing.B, rows int) (SSHCommandRunner, string) {
-	b.Helper()
-	if runtime.GOOS == "windows" {
-		b.Skip("the probe is a POSIX shell command")
-	}
-	dir := b.TempDir()
-	probed := filepath.Join(dir, "S.gpg-agent")
-	procTable := filepath.Join(dir, "unix")
-	if err := os.WriteFile(procTable, []byte(largeSocketTable(rows)), 0o644); err != nil {
-		b.Fatalf("write the stand-in kernel table: %v", err)
-	}
-	ssTable := filepath.Join(dir, "ss-table")
-	if err := os.WriteFile(ssTable, []byte(largeSSTable(rows)), 0o644); err != nil {
-		b.Fatalf("write the stand-in ss table: %v", err)
-	}
-	ssDir := filepath.Join(dir, "bin")
-	if err := os.Mkdir(ssDir, 0o755); err != nil {
-		b.Fatalf("make a directory for the ss stand-in: %v", err)
-	}
-	stub := "#!/bin/sh\ncat " + shellQuoteSingle(ssTable) + "\n"
-	if err := os.WriteFile(filepath.Join(ssDir, "ss"), []byte(stub), 0o755); err != nil {
-		b.Fatalf("write the ss stand-in: %v", err)
-	}
-	path := ssDir + string(os.PathListSeparator) + os.Getenv("PATH")
-	run := replaceProbeSource(localProbeRunner(path), procNetUnixPath, procTable)
-	return run, probed
-}
-
-// 留下一个无人监听的socket文件: 探针要读两张表才能判的状态. 是`deadSocketAt`
-// 的benchmark版(它要`testing.T`); 路径上已有文件先删, 否则bind会失败.
-func deadSocketAtForBench(b *testing.B, path string) {
-	b.Helper()
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		b.Fatalf("clear %s: %v", path, err)
-	}
-	l, err := net.Listen("unix", path)
+	forwardStandInSSH(t)
+	t.Setenv(forwardRefuseEnv, "1")
+	control, err := controlSocketPath(path)
 	if err != nil {
-		b.Fatalf("listen on %s: %v", path, err)
+		t.Fatalf("controlSocketPath() error = %v", err)
 	}
-	l.(*net.UnixListener).SetUnlinkOnClose(false)
-	if err := l.Close(); err != nil {
-		b.Fatalf("close the listener for %s: %v", path, err)
+
+	verdict, err := classifyRemoteSocket([]string{"host"}, path, control)
+	if verdict != forwardUnjudgeable {
+		t.Fatalf("verdict = %v (error %v), want forwardUnjudgeable when ssh never published a local port", verdict, err)
+	}
+	if !socketFileExists(t, path) {
+		t.Error("a socket was removed after an ssh that never published a local port")
 	}
 }
 
-// 量一次探针: 200000个绑定unix socket的主机, 路径上放一个死socket.
-// socket文件每轮重建(探针会删掉它), 要量的是探针而非删除;
-// `BenchmarkDeadSocketSetup`量搭建, 两者之差即探针自身成本.
-func BenchmarkRemoteSocketProbeOnALargeTable(b *testing.B) {
-	run, probed := benchProbeOnALargeTable(b, 200000)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		deadSocketAtForBench(b, probed)
-		b.StartTimer()
-		if _, err := probeRemoteSocket([]string{"host"}, probed, reclaimLeftover, run); err != nil {
-			b.Fatalf("probeRemoteSocket() error = %v", err)
+// 整套检查的端到端: 路径被另一个网络命名空间里的监听者占着; 一次性form
+// 命令在本机跑, 分类经替身`ssh`连接, 两张表都看不到的socket仍绝不会被删.
+// 这正是当初重写检查针对的失败形状(容器里的agent共享此目录), 必须保持拒绝.
+func TestCheckRemoteSocketFreeKeepsALiveSocketInAnotherNamespace(t *testing.T) {
+	requireShell(t)
+	socket := filepath.Join(shortTempDir(t), "S.gpg-agent")
+	startSocketInAnotherNamespace(t, socket)
+	forwardStandInSSH(t)
+
+	state, err := CheckRemoteSocketFree([]string{"host"}, socket, runSSHCommand)
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
+	}
+	if state != socketLive {
+		t.Errorf("state = %v, want socketLive: a listener in another namespace answers a connection", state)
+	}
+	if !socketFileExists(t, socket) {
+		t.Fatalf("%s was removed: a socket bound in another namespace lost its file", socket)
+	}
+}
+
+// 整套检查对着死socket跑: form命令报出它, 分类发现没人应答, 删除真的发生.
+// 这是用户要的默认行为, 无需任何开关.
+func TestCheckRemoteSocketFreeRemovesALeftoverEndToEnd(t *testing.T) {
+	requireShell(t)
+	socket := filepath.Join(shortTempDir(t), "S.gpg-agent")
+	deadSocketAt(t, socket)
+	forwardStandInSSH(t)
+
+	state, err := CheckRemoteSocketFree([]string{"host"}, socket, runSSHCommand)
+	if err != nil {
+		t.Fatalf("CheckRemoteSocketFree() error = %v, want the leftover removed and the session to start", err)
+	}
+	if state != socketReclaimed {
+		t.Errorf("state = %v, want socketReclaimed", state)
+	}
+	if socketFileExists(t, socket) {
+		t.Errorf("%s is still there: a dead socket blocks the next session's bind", socket)
+	}
+}
+
+// 对照socket生命周期的端到端形态: 无论判定如何, 检查在路径旁创建的socket
+// 事后都不见了; 绝不能留下无人监听的socket, 那会被当成用户自己的残留报给用户.
+func TestCheckRemoteSocketFreeLeavesTheControlSocketNowhere(t *testing.T) {
+	requireShell(t)
+	dir := shortTempDir(t)
+	socket := filepath.Join(dir, "S.gpg-agent")
+	deadSocketAt(t, socket)
+	forwardStandInSSH(t)
+
+	if _, err := CheckRemoteSocketFree([]string{"host"}, socket, runSSHCommand); err != nil {
+		t.Fatalf("CheckRemoteSocketFree() error = %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), controlSocketPrefix) {
+			t.Errorf("the control socket %s was left behind", e.Name())
 		}
 	}
 }
 
-// 量`BenchmarkRemoteSocketProbeOnALargeTable`花在探针之外的部分, 好把它减掉.
-func BenchmarkDeadSocketSetup(b *testing.B) {
-	if runtime.GOOS == "windows" {
-		b.Skip("the socket file is made with a unix listener")
+// 检查的本地资源是端口而非socket文件, 能留下的只有一个监听者;
+// 它开的每个端口都在退出时关闭, 判定路径与失败路径皆然.
+func TestClassifyRemoteSocketLeavesNoLocalListenerBehind(t *testing.T) {
+	requireShell(t)
+	dir := shortTempDir(t)
+	live := filepath.Join(dir, "live")
+	l := liveSocketAt(t, live)
+
+	before := countLoopbackListeners(t)
+	if _, err := classifyWithForwardStandIn(t, live); err != nil {
+		t.Fatalf("classifyRemoteSocket() error = %v", err)
 	}
-	path := filepath.Join(b.TempDir(), "S.gpg-agent")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		deadSocketAtForBench(b, path)
+	l.Close()
+	deadSocketAt(t, filepath.Join(dir, "dead"))
+	if _, err := classifyWithForwardStandIn(t, filepath.Join(dir, "dead")); err != nil {
+		t.Fatalf("classifyRemoteSocket() error = %v", err)
 	}
+	after := countLoopbackListeners(t)
+
+	// 替身`ssh`由检查杀掉, 它的监听者随之而去; 检查自己的两个由defer关闭.
+	// 有泄漏的话, 计数会一路爬升.
+	if after > before {
+		t.Errorf("loopback listeners went from %d to %d, so a local resource outlived the check", before, after)
+	}
+}
+
+// 返回loopback上正在监听的socket数, 即分类的本地端口.
+func countLoopbackListeners(t *testing.T) int {
+	t.Helper()
+	data, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		t.Skipf("no /proc/net/tcp to count listeners with: %v", err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[3] != "0A" {
+			continue // 不是监听中的socket
+		}
+		if strings.HasPrefix(fields[1], "0100007F:") {
+			n++
+		}
+	}
+	return n
+}
+
+// 给分类测试所依赖的脚手架装上牙齿: 替身若不再绑定并连接,
+// 那些测试的成败就与检查无关了.
+func TestForwardStandInServesTheForwardsItIsGiven(t *testing.T) {
+	requireShell(t)
+	dir := t.TempDir()
+	dead := filepath.Join(dir, "dead")
+	deadSocketAt(t, dead)
+	live := filepath.Join(dir, "live")
+	l := liveSocketAt(t, live)
+	defer l.Close()
+
+	control := filepath.Join(dir, "ctl")
+	hold, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("hold listener: %v", err)
+	}
+	defer hold.Close()
+	go func() {
+		for {
+			c, err := hold.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			time.Sleep(time.Minute)
+		}
+	}()
+	controlPort, err := freeLoopbackPort()
+	if err != nil {
+		t.Fatalf("freeLoopbackPort: %v", err)
+	}
+	targetPort, err := freeLoopbackPort()
+	if err != nil {
+		t.Fatalf("freeLoopbackPort: %v", err)
+	}
+
+	args, err := sshForwardArgs([]string{"dev@host"}, socketForwardSpec{
+		controlPort: controlPort,
+		controlPath: control,
+		targetPort:  targetPort,
+		targetPath:  live,
+		holdPort:    hold.Addr().(*net.TCPAddr).Port,
+	})
+	if err != nil {
+		t.Fatalf("sshForwardArgs() error = %v", err)
+	}
+	argsFile := filepath.Join(dir, "args")
+	if err := os.WriteFile(argsFile, []byte(strings.Join(args, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write the args file: %v", err)
+	}
+	t.Setenv(forwardArgsEnv, argsFile)
+
+	done := make(chan error, 1)
+	go func() { done <- runForwardStandIn(args) }()
+	// `runForwardStandIn`绑完后阻塞在末尾不返回(成功路径), 端口要等它出现再继续.
+	if err := waitForListener(controlPort); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForListener(targetPort); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(control); err != nil {
+		t.Fatalf("the stand-in did not bind the control path %s: %v", control, err)
+	}
+
+	// 对照链: 连上对照端口的连接会到达hold监听者并保持打开.
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", controlPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial the control port: %v", err)
+	}
+	defer c.Close()
+
+	// 目标侧: 活socket应答.
+	if kind := readKind(t, targetPort); kind != localHeld {
+		t.Errorf("target %s: %v, want localHeld", live, kind)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runForwardStandIn() error = %v", err)
+		}
+	default:
+	}
+}
+
+// 拨port并按分类的读法报出这次连接的结果.
+func readKind(t *testing.T, port int) localConnKind {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+	if err != nil {
+		return localUnclassifiable
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	buf := make([]byte, 1)
+	n, err := c.Read(buf)
+	if n > 0 {
+		return localHeld
+	}
+	if err == nil {
+		return localClosed
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return localHeld
+	}
+	return localClosed
+}
+
+// 等到loopback端口上有人监听为止.
+func waitForListener(port int) error {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if err == nil {
+			c.Close()
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("nothing began listening on 127.0.0.1:%d", port)
+}
+
+// 钉住整个分类所依赖的原始判断, 用纯TCP所以完全不依赖`ssh`.
+func TestClassifyLocalPortTellsHeldFromEnded(t *testing.T) {
+	t.Run("held", func(t *testing.T) {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer l.Close()
+		go func() {
+			var held []net.Conn
+			defer func() {
+				for _, c := range held {
+					c.Close()
+				}
+			}()
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				held = append(held, c)
+			}
+		}()
+		port := l.Addr().(*net.TCPAddr).Port
+		if got := classifyLocalPort(port, nil); got != localHeld {
+			t.Errorf("classifyLocalPort() = %v, want localHeld", got)
+		}
+	})
+
+	t.Run("ended", func(t *testing.T) {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer l.Close()
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				c.Close()
+			}
+		}()
+		port := l.Addr().(*net.TCPAddr).Port
+		if got := classifyLocalPort(port, nil); got != localClosed {
+			t.Errorf("classifyLocalPort() = %v, want localClosed", got)
+		}
+	})
+
+	t.Run("nothing there", func(t *testing.T) {
+		port, err := freeLoopbackPort()
+		if err != nil {
+			t.Fatalf("freeLoopbackPort: %v", err)
+		}
+		// 超时路径会花掉整个拨号预算, 所以用寿命很短的监听者来跑:
+		// `ssh`退出就是结束等待的东西.
+		exited := make(chan struct{})
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			close(exited)
+		}()
+		if got := classifyLocalPort(port, exited); got != localUnclassifiable {
+			t.Errorf("classifyLocalPort() = %v, want localUnclassifiable", got)
+		}
+	})
+}
+
+// `ssh`对本地端口0报"Bad local forwarding specification", 所以端口必须在这里选.
+func TestFreeLoopbackPortIsBindableAndNotZero(t *testing.T) {
+	seen := map[int]bool{}
+	for i := 0; i < 20; i++ {
+		port, err := freeLoopbackPort()
+		if err != nil {
+			t.Fatalf("freeLoopbackPort() error = %v", err)
+		}
+		if port == 0 {
+			t.Fatal("freeLoopbackPort() = 0, which ssh rejects in a forward specification")
+		}
+		if seen[port] {
+			t.Fatalf("freeLoopbackPort() returned %d twice in a row, so the port was not released", port)
+		}
+		seen[port] = true
+	}
+}
+
+func TestStrtosItoaIsUsedForPorts(t *testing.T) {
+	// forward规格用`strconv`而非格式串拼: 端口不会渲染成`ssh`读不出的拼写.
+	args, err := sshForwardArgs([]string{"host"}, socketForwardSpec{
+		controlPort: 1, controlPath: "/tmp/c", targetPort: 2, targetPath: "/tmp/t", holdPort: 3,
+	})
+	if err != nil {
+		t.Fatalf("sshForwardArgs() error = %v", err)
+	}
+	got := strings.Join(args, " ")
+	if !strings.Contains(got, "-L 127.0.0.1:1:/tmp/c") || !strings.Contains(got, "-R /tmp/c:127.0.0.1:3") {
+		t.Errorf("sshForwardArgs() = %q", got)
+	}
+	if strings.Contains(got, "%!") {
+		t.Errorf("sshForwardArgs() = %q, which carries a formatting artefact", got)
+	}
+	_ = strconv.Itoa
 }

@@ -2,9 +2,14 @@ package cli
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -47,10 +52,10 @@ var sshFlagDroppedForQuery = map[byte]bool{
 
 // sshOptionDroppedForQuery: 表里的关键字用ssh比较时的小写拼写.
 // 转发类关键字是`-R`/`-L`/`-D`的另一条路: 探测连接自己建转发会绑上正要检查的路径, 查询就把
-// 主机判成忙, 于是每次都被拒绝; 丢弃而非覆盖: ssh对标量取先读到的值, 本包后写的挤不掉;
-// 清空值由`sshCommandArgs`写在用户参数之前, 用户的`-o ClearAllForwardings=no`盖不过它;
-// forward逐条追加, 后加的也挤不掉; 其余关键字改变连接做什么: 用户的命令会顶掉查询的,
-// `ForkAfterAuthentication`让查询进后台而没有回答可读, 强制tty会变成交互输出.
+// 主机判成忙, 于是每次都被拒绝.
+// 丢弃而非覆盖: ssh对标量取先读到的值, 本包后写的挤不掉; 清理由sshCommandArgs写在用户参数之前
+// (详见 `sshCommandArgs`), 用户的`-o ClearAllForwardings=no`盖不过它; forward逐条追加, 后加的
+// 也挤不掉; 其余关键字改变连接做什么: 用户的命令, `ForkAfterAuthentication`, 强制tty.
 var sshOptionDroppedForQuery = map[string]bool{
 	"remoteforward":           true,
 	"localforward":            true,
@@ -243,250 +248,500 @@ func octalEscapes(s string) string {
 	return b.String()
 }
 
-// 探针的判定标记按整行匹配, 不按子串: 登录横幅里可能出现"present"这类普通词.
+// 远端socket预检只问: sshd将要绑定的路径上有没有东西在监听; 判成"没有"判错就是在删在用的socket.
+// 证据是远端主机自己对路径的连接, 不是读socket表: 表只描述一个网络命名空间, 别的命名空间里的
+// 监听者两边都不出现, 会被当成残留删掉.
+// 三步只有第三步可能删除: 1) 路径上是什么 (只用shell内建), 不可写或不是socket就拒绝, 可写的
+// socket进2). 2) 阳性对照: 让主机连自建socket, 否则`AllowStreamLocalForwarding`/`PermitOpen`的
+// 拒绝与没人监听不可分; 3) 连接保持=监听者, 立刻结束才删; 判不了即拒绝, --skip-remote-check是出口.
 const (
-	socketAbsentMarker     = "gpg-agent-forward-socket-absent"
-	socketReclaimedMarker  = "gpg-agent-forward-socket-reclaimed"
-	socketLiveMarker       = "gpg-agent-forward-socket-live"
+	// socketAbsentMarker: 路径上什么都没有; 标记都按整行匹配, 登录横幅里的普通词不算判定.
+	socketAbsentMarker = "gpg-agent-forward-socket-absent"
+	// socketUnwritableMarker: 有东西在, 本用户不可写.
+	socketUnwritableMarker = "gpg-agent-forward-socket-unwritable"
+	// socketNotASocketMarker: 可写但不是socket.
 	socketNotASocketMarker = "gpg-agent-forward-socket-notasocket"
-	socketStaleMarker      = "gpg-agent-forward-socket-stale"
-	socketStuckMarker      = "gpg-agent-forward-socket-stuck"
-	socketUnknownMarker    = "gpg-agent-forward-socket-unknown"
-	socketUnresolvedMarker = "gpg-agent-forward-socket-unresolved"
-	socketSymlinkMarker    = "gpg-agent-forward-socket-symlink"
+	// socketSocketMarker: 可写的socket在; 有没有东西应答, 由分类那步的连接去问.
+	socketSocketMarker = "gpg-agent-forward-socket-socket"
+	// socketUnknownMarker: 主机答了, 但没有可用的判定行.
+	socketUnknownMarker = "gpg-agent-forward-socket-unknown"
+	// socketReclaimedMarker和socketStuckMarker: 删除的两种结果, 文件已删掉或还在.
+	socketReclaimedMarker = "gpg-agent-forward-socket-reclaimed"
+	socketStuckMarker     = "gpg-agent-forward-socket-stuck"
 )
 
-type remoteSocketState int
-
-const (
-	socketFree        remoteSocketState = iota // 路径上什么都没有
-	socketReclaimed                            // 死socket已被删除
-	socketStale                                // 死socket还在, 没有动它
-	socketLive                                 // 有东西在监听
-	socketNotASocket                           // 挡路的是非socket文件
-	socketStuck                                // 死socket还在, 删不掉
-	socketUnjudgeable                          // 主机无法判定
-	socketUnreported                           // 探针没有报出任何判定
-	socketUnresolved                           // 路径在主机上无法解析
-	socketSymlink                              // 路径是符号链接
-)
-
-// reclaimPolicy: 调用方允许探针对没东西绑定的socket做什么.
-// 用具名类型而不是bool: 两个策略差在是否删除远端文件, keepLeftover是零值, 忘了选也安全.
-type reclaimPolicy bool
-
-const (
-	// keepLeftover: 只报告, 不动文件, 也是默认值. 已死的证据只覆盖本网络命名空间,
-	// 别的命名空间里的监听者两个来源都不出现 (详见 `remoteSocketProbe`).
-	keepLeftover reclaimPolicy = false
-	// reclaimLeftover: 删除它, 调用方以此接受来源排除不了别的命名空间里的监听者.
-	reclaimLeftover reclaimPolicy = true
-)
-
-// procNetUnixPath: 探针读的第二份独立证据, 内核的unix socket表.
-// 写成常量是为了让测试能替换这个名字: 绝对路径`/proc/net/unix`没法被unmount或改成不可读.
-const procNetUnixPath = "/proc/net/unix"
-
-// ssStatusTag: 探针在ss的表后面打的那行, 带ss的退出状态.
-// 状态随它所属的输出一起回来, 一次ss运行就同时回答"ss说了什么"和"ss到底跑没跑".
-const ssStatusTag = "gpg-agent-forward-ss-status"
-
-// remoteSocketProbe: 构建报告path处情况的远端命令, 只在reclaim允许时删除死socket.
-// 判定与删除同行: 只有主机能分辨死socket与活socket; 检查与rm之间仍有竞态, 远端无锁可拿.
-// 命令必须是一行: sshd先把整串交给远端用户的登录shell, csh/tcsh拒绝跨行的引号词 (Unmatched '),
-// 于是什么都不跑; sh -c只为脚本体给出已知解释器; 删除只做能正面排除的情况: 活socket永不删;
-// ss是程序, 可能过滤行或出错, 单凭它不算数; 要`ss -xl`与`/proc/net/unix`两个独立来源都说路径已死,
-// 读不到的来源不算"没有"; 内核表按路径而非inode匹配; 解码先经证明 (\134读回与反斜杠比较).
-func remoteSocketProbe(path string, reclaim reclaimPolicy) string {
-	// 两个来源都否认时:删除是对远端的改动,仅在调用方要求时做,默认只报状态
-	leftoverArm := "else echo " + socketStaleMarker + "; fi;"
-	if reclaim == reclaimLeftover {
-		// 删除用解析后的拼写,不用用户输入的那个:检查过表的是解析后的拼写,
-		// 目录组件在检查与删除之间换了指向时,删除不得改到表从未查过的文件上.
-		leftoverArm = "elif rm -f -- \"$np\"; then echo " + socketReclaimedMarker + "; else echo " + socketStuckMarker + "; fi;"
-	}
-
-	// 分片拼接只为可读;这条远程命令必须保持单行
+// remoteSocketForm: 一条远端命令, 只用shell自己的测试报告path上是什么.
+// 用内建测试而不依赖程序: 没有stat, ls, grep的主机答得一样好, 而这个答案决定删不删.
+// 答案的含义: 不存在是健康情况 (指向不存在目标的符号链接同理, 会话的bind会替掉链接); 不可写
+// 就拒绝, 因为连接socket要它的写权限, 而拒绝连接与"没人监听"从本地端看一样, 只能正面测.
+// 路径在脚本里解码, 不上命令行: 远端登录shell先解析, csh/tcsh连单引号内也做历史展开,
+// 详见 octalEscapes; 也让ssh对-L/-R的百分号展开无事可做, 详见 `percentEscape`.
+func remoteSocketForm(path string) string {
 	script := strings.Join([]string{
-		// 路径在脚本内解码而非写进命令:一个字节也不能上命令行,原因详见`octalEscapes`.
-		// 解码取决于宿主机的`printf`:POSIX要求它读`\NNN`,不支持的实现会把转义原样打印,
-		// 那样的`p`既非空也非路径,每项检查都答"否",会报成路径不存在,正是本探针要避免的判定.
-		// 故先验证解码:用`\134`(反斜杠的转义)检验`printf`;这是对`printf`的检验,不是对路径的限制.
 		`[ "$(printf '\134')" = '\' ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
 		"p=$(printf " + shellQuoteSingle(octalEscapes(path)) + ");",
-		// 解码的另一种失败:`printf`不存在或对格式什么都不打印,得到空路径;
-		// 空`p`不是文件,每项检查都会对没查过的路径答"否",与`printf`把转义原样打印时是同一种误读.
-		"[ -n \"$p\" ] || { echo " + socketUnknownMarker + "; exit 0; };",
-		// cand PATH OTHERPATH [GREP ARGS...]:留下表里提到任一path的行,
-		// 以及调用方模式选中的行,每行补一个尾随空格.OTHERPATH可为空,表示没有第二种拼写.
-		// 表本身不进shell变量:几十万socket的表有几十MB,shell得先吃下全部才能看;
-		// `grep`流式读,只留提到路径的少数行.
-		// 行尾空格让整字段判定可行:shell模式锚不住行尾,否则行末路径会像更长名字的前缀.
-		"cand() { q=$1; r=$2; shift 2; if [ -n \"$r\" ]; then grep -F -e \" $q\" -e \" $r\" \"$@\" | sed 's/$/ /'; else grep -F -e \" $q\" \"$@\" | sed 's/$/ /'; fi; };",
-		"if [ -L \"$p\" ]; then echo " + socketSymlinkMarker + ";",
-		"elif [ -e \"$p\" ]; then",
-		"if [ -S \"$p\" ]; then",
-		// 向表询问的是解析后的拼写,未必是用户写的那个:内核按监听者绑定的拼写记录,
-		// 经符号链接,".."或重复斜杠到达的路径,对按用户拼写的搜索不可见,
-		// 而"两个表都不可见"正是删除的依据.
-		// 只解析目录,最后一段保持原样,路径本身是符号链接时仍判不了.
-		// `readlink -f`是解析目录的办法,没有它时用`realpath`;仅在指向同一文件时才采用其结果.
-		"np=;",
-		"case $p in */*) nd=${p%/*}; ns=${p##*/};; *) nd=.; ns=$p;; esac;",
-		"[ -n \"$nd\" ] || nd=/;",
-		"rp=$(readlink -f -- \"$nd\" 2>/dev/null) || rp=;",
-		"[ -n \"$rp\" ] || rp=$(realpath -- \"$nd\" 2>/dev/null) || rp=;",
-		"if [ -n \"$rp\" ]; then case $rp in */) np=$rp$ns;; *) np=$rp/$ns;; esac; fi;",
-		"if [ -n \"$np\" ] && [ \"$p\" -ef \"$np\" ] 2>/dev/null; then :; else np=; fi;",
-		// 含控制字符的路径无法按整字段搜索:搜索的单位是行,名字里有换行就成了两个字段.
-		// 只有符号链接的目标能造出这种路径,它使"没有绑定到该路径"不可证.
-		"case $np in *[[:cntrl:]]*) np=;; esac;",
-		// 先读内核表:单凭它就能判路径被占用,没`ss`的主机也报得出活agent socket,
-		// 否则这类主机上用户会去开`--skip-remote-check`.
-		"proc_table=no; proc_live=no;",
-		"if [ -r " + procNetUnixPath + " ]; then",
-		// 表头按两个相邻列名匹配而非整行:内核用成串空格补齐,模式里没有"一个或多个".
-		// 这两个词是文件真被读到的证据:可读却永不应答的占位文件不能当作省略该路径的表.
-		// 表头在第一行,查到此即停.
-		"grep -F -q -e 'RefCount Protocol ' < " + procNetUnixPath + " 2>/dev/null && proc_table=yes;",
-		"proc_cand=$(cand \"$p\" \"$np\" < " + procNetUnixPath + " 2>/dev/null);",
-		"case \"$proc_cand\" in *\" $p \"*) proc_live=yes;; esac;",
-		"if [ \"$proc_live\" = no ] && [ -n \"$np\" ] && [ \"$np\" != \"$p\" ]; then case \"$proc_cand\" in *\" $np \"*) proc_live=yes;; esac; fi;",
-		"fi;",
-		"if [ \"$proc_live\" = yes ]; then echo " + socketLiveMarker + ";",
-		"elif command -v ss >/dev/null 2>&1; then",
-		// `ss`的退出状态随其输出一起带回而非存进变量:管道只报最后一条命令的状态,
-		// 要单独拿`ss`的状态就得先存下整张表;探针把状态作为表后一行打印,与表一起被`grep`捞出.
-		"ss_cand=$( { LC_ALL=C ss -xl 2>/dev/null; printf '\\n%s=%s\\n' " + ssStatusTag + " \"$?\"; } " +
-			"| cand \"$p\" \"$np\" -e '" + ssStatusTag + "=' -e 'Netid State ' );",
-		"ss_ok=no; case \"$ss_cand\" in *\"" + ssStatusTag + "=0 \") ss_ok=yes;; esac;",
-		"ss_table=no; case \"$ss_cand\" in *'Netid State '*) ss_table=yes;; esac;",
-		"ss_live=no; case \"$ss_cand\" in *\" $p \"*) ss_live=yes;; esac;",
-		"if [ \"$ss_live\" = no ] && [ -n \"$np\" ] && [ \"$np\" != \"$p\" ]; then case \"$ss_cand\" in *\" $np \"*) ss_live=yes;; esac; fi;",
-		"if [ \"$ss_live\" = yes ]; then echo " + socketLiveMarker + ";",
-		"elif [ -z \"$np\" ]; then echo " + socketUnresolvedMarker + ";",
-		"elif [ \"$ss_ok\" = no ] || [ \"$ss_table\" = no ] || [ \"$proc_table\" = no ]; then echo " + socketUnknownMarker + ";",
-		leftoverArm,
-		"else echo " + socketUnknownMarker + "; fi;",
-		"else echo " + socketNotASocketMarker + "; fi;",
-		"else echo " + socketAbsentMarker + "; fi",
+		`[ -n "$p" ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
+		`if [ ! -e "$p" ]; then echo ` + socketAbsentMarker + `;`,
+		`elif [ ! -w "$p" ]; then echo ` + socketUnwritableMarker + `;`,
+		`elif [ ! -S "$p" ]; then echo ` + socketNotASocketMarker + `;`,
+		`else echo ` + socketSocketMarker + `; fi`,
+	}, " ")
+	// sh -c只保证脚本体的解释器: 外层命令sshd已交给登录shell, 可能是csh.
+	return "sh -c " + shellQuoteSingle(script)
+}
+
+// remoteSocketRemove: 一条远端命令删掉path并报告结果.
+// 判定就是rm自己的状态: rm -f成功即文件已不在, 失败即删不掉, 不必再看一次路径.
+func remoteSocketRemove(path string) string {
+	script := strings.Join([]string{
+		`[ "$(printf '\134')" = '\' ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
+		"p=$(printf " + shellQuoteSingle(octalEscapes(path)) + ");",
+		`[ -n "$p" ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
+		`if rm -f -- "$p" 2>/dev/null; then echo ` + socketReclaimedMarker + `; else echo ` + socketStuckMarker + `; fi`,
 	}, " ")
 	return "sh -c " + shellQuoteSingle(script)
 }
 
-// 询问远端path处有什么并按reclaim的限度行动.
-// 活socket(远端agent或他人同路径)与非socket文件不碰;判明需两路证据,
-// 缺一路,失败或答的不是表都算没答.一路为何不够,遗留为何默认只报不删,详见`remoteSocketProbe`.
-// 状态仅在error为nil时有意义:判不出来返回`socketUnjudgeable`.
-func probeRemoteSocket(sshArgs []string, remoteSocket string, reclaim reclaimPolicy, run SSHCommandRunner) (remoteSocketState, error) {
-	out, err := run(sshArgs, remoteSocketProbe(remoteSocket, reclaim))
-	if err != nil {
-		// 原样返回:调用方各自会加上自己的语境,在此包装会文不对题
-		return socketUnjudgeable, err
-	}
+// socketForm: 一次性远端命令在路径上看到的结果.
+type socketForm int
+
+const (
+	// formUnknown: 主机答了, 但没有可用的判定行; 路径仍属未知, 不能删.
+	formUnknown socketForm = iota
+	// formAbsent: 路径上什么都没有.
+	formAbsent
+	// formUnwritable: 路径上有东西, 本用户不可写.
+	formUnwritable
+	// formNotASocket: 路径上可写但不是socket.
+	formNotASocket
+	// formSocket: 路径上是可写的socket; 有没有应答由分类决定.
+	formSocket
+)
+
+// parseSocketForm: 读form命令打出的那一行判定.
+// 不是任何标记的内容 (没有输出, 横幅, 主机跑了别的) 都算formUnknown.
+func parseSocketForm(out string) socketForm {
 	for _, line := range strings.Split(out, "\n") {
 		switch strings.TrimSpace(line) {
 		case socketAbsentMarker:
-			return socketFree, nil
-		case socketReclaimedMarker:
-			return socketReclaimed, nil
-		case socketStaleMarker:
-			return socketStale, nil
-		case socketLiveMarker:
-			return socketLive, nil
+			return formAbsent
+		case socketUnwritableMarker:
+			return formUnwritable
 		case socketNotASocketMarker:
-			return socketNotASocket, nil
-		case socketStuckMarker:
-			return socketStuck, nil
+			return formNotASocket
+		case socketSocketMarker:
+			return formSocket
 		case socketUnknownMarker:
-			return socketUnjudgeable, nil
-		case socketUnresolvedMarker:
-			return socketUnresolved, nil
-		case socketSymlinkMarker:
-			return socketSymlink, nil
+			return formUnknown
 		}
 	}
-	// 一行判定都没有:探针没按预期跑起来(无`sh`,登录shell解析不了,输出被过滤).
-	// 没删东西但也没查东西,是独立判定而非"free",由调用方定夺,详见`CheckRemoteSocketFree`.
-	return socketUnreported, nil
+	return formUnknown
+}
+
+// remoteSocketState: 检查在远端路径上看到什么, 又做了什么; 零值就是允许起会话的状态.
+type remoteSocketState int
+
+const (
+	socketFree        remoteSocketState = iota // 路径上什么都没有
+	socketReclaimed                            // 遗留socket已被删除
+	socketLive                                 // 有东西在监听
+	socketNotASocket                           // 挡路的是非socket文件
+	socketStuck                                // 遗留socket还在, 删不掉
+	socketUnjudgeable                          // 主机问不到, 或没有回答
+)
+
+// probeRemoteSocketForm: 问远端remoteSocket处有什么; 只有错误为nil时状态才有意义.
+func probeRemoteSocketForm(sshArgs []string, remoteSocket string, run SSHCommandRunner) (socketForm, error) {
+	out, err := run(sshArgs, remoteSocketForm(remoteSocket))
+	if err != nil {
+		// 原样返回: 调用方用自己的措辞描述这个失败, 包一层只会重复.
+		return formUnknown, err
+	}
+	return parseSocketForm(out), nil
+}
+
+// 分类连接用的`ClearAllForwardings`取值,刻意与一次性查询连接相反:该项全有全无,
+// 置yes会把本连接所需的`-R`和两个`-L`一起清掉;置no只留下配置文件给该主机的转发,本就属于本次会话.
+const sshKeepForwardings = "ClearAllForwardings=no"
+
+type socketForwardSpec struct {
+	// sshd连到`controlPath`时发布的本地端口,承载正向控制
+	controlPort int
+	// 本检查自建自管的远端socket路径,控制只碰它,绝不是被测路径
+	controlPath string
+	// sshd连到`targetPath`时发布的本地端口,承载分类判定
+	targetPort int
+	targetPath string
+	// 控制socket回连的本地端口:接受并保持连接才算完成控制
+	holdPort int
+}
+
+// 分类连接的ssh参数:沿用调用方的连接参数到达同一主机,另加三个转发
+// (`-R`控制socket归远端,`-L`让sshd连到它,`-L`被测路径).
+// 路径位于`-L`/`-R`规格内,ssh会展开其中的%记号,故先转义,详见`percentEscape`.
+// 加`-N`是因为本连接只有转发;`ClearAllForwardings=no`的理由详见`sshKeepForwardings`.
+func sshForwardArgs(sshArgs []string, spec socketForwardSpec) ([]string, error) {
+	destination, connFlags, err := ParseSSHArgs(sshArgs)
+	if err != nil {
+		return nil, err
+	}
+	args := make([]string, 0, len(connFlags)+12)
+	args = append(args, "-o", sshKeepForwardings, "-N")
+	args = append(args, connFlags...)
+	args = append(args,
+		"-R", percentEscape(spec.controlPath)+":127.0.0.1:"+strconv.Itoa(spec.holdPort),
+		"-L", "127.0.0.1:"+strconv.Itoa(spec.controlPort)+":"+percentEscape(spec.controlPath),
+		"-L", "127.0.0.1:"+strconv.Itoa(spec.targetPort)+":"+percentEscape(spec.targetPath),
+	)
+	args = append(args, destination)
+	return args, nil
+}
+
+// 正向控制的socket名前缀:要短,因得挤在被测路径旁,后者本身可能已接近
+// unix socket路径107字节的上限;又要有辨识度,免得被当成别人的socket.
+const controlSocketPrefix = ".gpg-agent-forward-"
+
+// 正向控制所用socket的远端路径:放在被测路径所在目录旁,sshd要绑该路径,
+// 该目录本就必须可写,于是问题值得问的场景里控制也一定绑得上.
+// 名字唯一,不会与被测路径或别的检查撞;结果不可用时报错而非截断:
+// 旁放不下控制socket的路径判不了,是拒绝,不是删除.
+func controlSocketPath(remoteSocket string) (string, error) {
+	suffix, err := randomHex(6)
+	if err != nil {
+		return "", err
+	}
+	dir := path.Dir(remoteSocket)
+	if dir == "" || dir == "." {
+		dir = "/"
+	}
+	p := path.Join(dir, controlSocketPrefix+suffix)
+	if p == remoteSocket {
+		return "", fmt.Errorf("the control socket would be the path under test (%s)", p)
+	}
+	if err := ValidateRemoteSocket(p); err != nil {
+		return "", fmt.Errorf("the control socket for %s: %w", remoteSocket, err)
+	}
+	return p, nil
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+type socketForwardVerdict int
+
+const (
+	// forwardUnjudgeable:控制未通过或连接没做成,此判定下什么都不能删
+	forwardUnjudgeable socketForwardVerdict = iota
+	// forwardLive:有东西应答并保持连接
+	forwardLive
+	// forwardDead:连接没答话就结束了
+	forwardDead
+)
+
+type localConnKind int
+
+const (
+	// localUnclassifiable:连不上或ssh已退出,由此得不出关于远端路径的判定
+	localUnclassifiable localConnKind = iota
+	// localHeld:已连接,既无话语也不关闭
+	localHeld
+	// localClosed:已连接,连接没答话就结束了
+	localClosed
+)
+
+// 分类等待ssh发布本地端口的时限:覆盖ssh自身的连接,故给得宽;
+// 预检发生在安装信号处理之前,答得慢的主机也要分类得出而非放弃.
+const socketProbeDialTimeout = 6 * time.Second
+
+// 连接保持沉默多久算被持有:无人监听的socket会立刻结束连接,所以这不是耐心,
+// 而是答案可靠的那一半:沉默这么久仍开着的连接已被不说话的进程接受(gpg-agent即是).
+// 留的疑问朝安全方向:慢到连不上都要这么久的远端读作live,检查即拒绝.
+const socketProbeReadTimeout = 1200 * time.Millisecond
+
+// 让远端主机自己连remoteSocket,据此报告那里有什么.
+// 答案不可信者(控制未通过或连接没做成)一律返回`forwardUnjudgeable`:
+// 无控制则无判定,详见`remoteSocketForm`.
+func classifyRemoteSocket(sshArgs []string, remoteSocket, controlPath string) (socketForwardVerdict, error) {
+	// 控制`-R`转发的本地端:sshd连上远端控制socket并把连接隧道到这里,
+	// 接受并保持它才算走完控制所证明的那条链.
+	hold, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return forwardUnjudgeable, err
+	}
+	defer hold.Close()
+	acceptAndHold(hold)
+
+	controlPort, err := freeLoopbackPort()
+	if err != nil {
+		return forwardUnjudgeable, err
+	}
+	targetPort, err := freeLoopbackPort()
+	if err != nil {
+		return forwardUnjudgeable, err
+	}
+
+	args, err := sshForwardArgs(sshArgs, socketForwardSpec{
+		controlPort: controlPort,
+		controlPath: controlPath,
+		targetPort:  targetPort,
+		targetPath:  remoteSocket,
+		holdPort:    hold.Addr().(*net.TCPAddr).Port,
+	})
+	if err != nil {
+		return forwardUnjudgeable, err
+	}
+
+	cmd := exec.Command("ssh", args...)
+	// 保留ssh关于被拒转发的输出:它指出该看哪一侧;用与查询连接相同的有界缓冲,话痨主机撑不大进程
+	var stderr boundedBuffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return forwardUnjudgeable, err
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	// 每条路径上都杀ssh,成功路径也一样:那时连接已给出答案,不再需要它
+	defer func() {
+		_ = cmd.Process.Kill()
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	if kind := classifyLocalPort(controlPort, exited); kind != localHeld {
+		// 控制没走通:本地端口关闭或缺失说明不了远端路径什么,sshd拒绝stream-local连接
+		// 与无人监听的socket长得一模一样;ssh有话时附在后面.
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			detail = "; ssh said: " + lastLine(detail)
+		}
+		return forwardUnjudgeable, fmt.Errorf(
+			"the control connection through %s was not established (%v)%s", controlPath, kind, detail)
+	}
+	switch classifyLocalPort(targetPort, exited) {
+	case localHeld:
+		return forwardLive, nil
+	case localClosed:
+		return forwardDead, nil
+	default:
+		return forwardUnjudgeable, fmt.Errorf(
+			"nothing answered on the local port %s was to be connected through; ssh said: %s",
+			remoteSocket, lastLine(strings.TrimSpace(stderr.String())))
+	}
+}
+
+// ssh把结束原因放在最后一行
+func lastLine(s string) string {
+	if s == "" {
+		return "(nothing)"
+	}
+	lines := strings.Split(s, "\n")
+	return lines[len(lines)-1]
+}
+
+// 端口是等来的而非假定:ssh在自身连接建立后才发布它,认证未完时什么都还没发布;
+// ssh已退出则提前结束等待,没发布过的端口不会再有.
+func classifyLocalPort(port int, exited <-chan struct{}) localConnKind {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(socketProbeDialTimeout)
+	var conn net.Conn
+	for {
+		c, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		if err == nil {
+			conn = c
+			break
+		}
+		select {
+		case <-exited:
+			return localUnclassifiable
+		default:
+		}
+		if !time.Now().Before(deadline) {
+			return localUnclassifiable
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	defer conn.Close()
+
+	// 连接结束:无字节且无超时;连接被持有:读以超时告终.字节是第三种结果,也是独立答案:
+	// 对面有东西可对话,即为活路径.
+	if err := conn.SetReadDeadline(time.Now().Add(socketProbeReadTimeout)); err != nil {
+		return localUnclassifiable
+	}
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if n > 0 {
+		return localHeld
+	}
+	if err == nil {
+		return localClosed
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return localHeld
+	}
+	return localClosed
+}
+
+// 接受l上的连接并一直保持,直到l关闭;这是控制`-R`转发的本地落点:连接保持即证据,
+// 有意不说话,让控制与目标用同一种读法(持有或结束).
+func acceptAndHold(l net.Listener) {
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				c.Close()
+			}
+		}()
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c)
+		}
+	}()
+}
+
+// 返回一个无人监听的loopback端口;返回前已关闭,存在被别人抢走的窗口.
+// 不能用`ssh -L`的0端口绕开:ssh拒绝零本地端口("Bad local forwarding specification").
+// 窗口代价有界且朝安全方向:绑不上时ssh报错退出,等端口落空,分类做不成,检查拒绝.
+func freeLoopbackPort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	if err := l.Close(); err != nil {
+		return 0, err
+	}
+	return port, nil
+}
+
+// 预检用的分类函数;做成变量便于测试替换判定,无需假ssh即可覆盖调用方各分支;
+// 连接本身在`remote_probe_test.go`里用真绑定真连接的假ssh端到端覆盖.
+var classifyRemoteSocketForward = classifyRemoteSocket
+
+// 删除远端remoteSocket并报告是否已消失;两种结果都没报算删除失败,不算成功
+func removeRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRunner) (bool, error) {
+	out, err := run(sshArgs, remoteSocketRemove(remoteSocket))
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		switch strings.TrimSpace(line) {
+		case socketReclaimedMarker:
+			return true, nil
+		case socketStuckMarker:
+			return false, nil
+		}
+	}
+	return false, nil
 }
 
 // 让sshd即将绑定的远端路径可用,不可用则说明原因.
 // 活socket属于远端自己的gpg-agent:转发时sshd的`StreamLocalBindUnlink`会顶掉它占位,
-// gpg便静默连上别的agent,故拒绝覆盖.无人监听的遗留由调用方(reclaim)决定删不删:
-// 证据只管一个网络命名空间,默认`keepLeftover`停下引导,`reclaimLeftover`删除后放行.
-// 仅error为nil才放行;判不出来(问不到,解不了路径,读不了表)一律拒绝并带`--skip-remote-check`.
-func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, reclaim reclaimPolicy, run SSHCommandRunner) (remoteSocketState, error) {
-	state, err := probeRemoteSocket(sshArgs, remoteSocket, reclaim, run)
+// gpg便静默连上别的agent,故拒绝覆盖;无人监听的遗留只在正向控制确认无人应答后才删除,
+// 使用中的socket,写不了的路径,连不上的主机都拒绝而非猜.
+// 仅error为nil才放行;`socketUnjudgeable`带`--skip-remote-check`,
+// `socketLive`,`socketNotASocket`,`socketStuck`是明确判定,不带该开关,都该停下.
+func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommandRunner) (remoteSocketState, error) {
+	form, err := probeRemoteSocketForm(sshArgs, remoteSocket, run)
 	if err != nil {
-		return state, fmt.Errorf("checking what is at %s on the remote host: %w", remoteSocket, err)
+		return socketUnjudgeable, fmt.Errorf("checking what is at %s on the remote host: %w", remoteSocket, err)
 	}
-	switch state {
-	case socketFree, socketReclaimed:
-		return state, nil
-	case socketUnreported:
-		return state, fmt.Errorf(
-			"could not check what is at %s on the remote host: the probe there reported nothing.\n"+
-				"  A host with no sh, a login shell that cannot run the probe, and a session whose output is filtered all look like this.\n"+
+	switch form {
+	case formAbsent:
+		return socketFree, nil
+	case formUnwritable:
+		return socketUnjudgeable, fmt.Errorf(
+			"%s on the remote host cannot be written by your user there, so whether anything is listening on it cannot be told from here.\n"+
+				"  Connecting to a socket needs write permission on it, and a refusal reaches this side as a connection that\n"+
+				"  ended - the same thing a socket nothing is listening on looks like. A user-run removal would fail on it too,\n"+
+				"  so this tool does not try: removing a file it cannot write is not something it should do on your behalf.\n"+
+				"  Look at the file there (ls -l), or pass --remote-socket PATH to use a different path,\n"+
+				"  or pass --skip-remote-check to start without the check and accept that sshd may bind over a live agent socket.",
+			remoteSocket)
+	case formNotASocket:
+		return socketNotASocket, fmt.Errorf(
+			"%s exists on the remote host and is not a socket, so it is not a leftover agent socket.\n"+
+				"  Refusing to remove it. Move it out of the way, or pass --remote-socket PATH to use a different path.",
+			remoteSocket)
+	case formUnknown:
+		return socketUnjudgeable, fmt.Errorf(
+			"could not check what is at %s on the remote host: the host did not answer.\n"+
+				"  A host with no sh, a login shell that cannot run the command, a shell whose printf does not read the \\NNN\n"+
+				"  escapes the path travels as, and a session whose output is filtered all look like this.\n"+
 				"  Starting without the check would let sshd bind over a live gpg-agent socket, and gpg would then follow the wrong agent.\n"+
 				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
 			remoteSocket)
-	case socketStale:
-		return state, fmt.Errorf(
-			"a socket nothing is listening on is left at %s on the remote host, and it is not removed unless you ask for that.\n"+
-				"  The evidence that it is dead comes from that host's own socket tables, and those describe one network\n"+
-				"  namespace: an agent in a container that shares the directory is absent from both of them, so removing\n"+
-				"  the file would take a socket that is in use away from it.\n"+
-				"  Remove it there if nothing else is using it:\n"+
-				"      rm -f -- %s\n"+
-				"  or pass --reclaim-remote-socket to have gpg-agent-forward remove it and start the session.",
-			remoteSocket, shellQuoteSingle(remoteSocket))
-	case socketLive:
-		return state, fmt.Errorf(
+	}
+
+	control, err := controlSocketPath(remoteSocket)
+	if err != nil {
+		return socketUnjudgeable, fmt.Errorf("could not tell whether %s on the remote host is in use: %w", remoteSocket, err)
+	}
+	verdict, err := classifyRemoteSocketForward(sshArgs, remoteSocket, control)
+	// 控制socket是本检查在远端的自有临时资源,无论分类结论如何都删;删除失败不报:
+	// 留下的只是无人监听的socket,正是下次预检会回收的东西.
+	removeRemoteSocketBestEffort(sshArgs, control, run)
+	if err != nil {
+		return socketUnjudgeable, fmt.Errorf(
+			"could not tell whether %s on the remote host is in use: %v.\n"+
+				"  The check works by having that host connect to the path, through a socket it creates next to it and then\n"+
+				"  removes; that connection is what could not be made. An sshd that refuses stream-local forwarding\n"+
+				"  (AllowStreamLocalForwarding no, PermitOpen limits, or a forward the host's own configuration clears)\n"+
+				"  refuses it, and a refusal is indistinguishable from a socket nothing is listening on, so nothing was removed.\n"+
+				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
+			remoteSocket, err)
+	}
+	switch verdict {
+	case forwardLive:
+		return socketLive, fmt.Errorf(
 			"%s already exists on the remote host, so it is in use by that host's own gpg-agent.\n"+
 				"  Forwarding onto it would make gpg talk to the remote agent instead of the Windows one.\n"+
 				"  Stop the remote agent first:\n"+
 				"      gpgconf --kill gpg-agent\n"+
 				"      echo no-autostart >> ~/.gnupg/gpg.conf\n"+
-				"  (and remove the leftover socket if it survives: rm -f %s)\n"+
+				"  (and remove the leftover socket if it survives: rm -f -- %s)\n"+
 				"  Pass --remote-socket PATH to use a different path instead.",
 			remoteSocket, shellQuoteSingle(remoteSocket))
-	case socketNotASocket:
-		return state, fmt.Errorf(
-			"%s exists on the remote host and is not a socket, so it is not a leftover agent socket.\n"+
-				"  Refusing to remove it. Move it out of the way, or pass --remote-socket PATH to use a different path.",
-			remoteSocket)
-	case socketStuck:
-		return state, fmt.Errorf(
-			"a socket nothing is listening on is left at %s on the remote host, and it could not be removed.\n"+
-				"  Remove it there, or pass --remote-socket PATH to use a different path.",
-			remoteSocket)
-	case socketSymlink:
-		return state, fmt.Errorf(
-			"%s on the remote host is a symbolic link, so whether a live agent socket is behind it cannot be told from here.\n"+
-				"  Refusing to remove the link or to bind over it. Point --remote-socket PATH at the real path instead.",
-			remoteSocket)
-	case socketUnresolved:
-		return state, fmt.Errorf(
-			"could not work out what %s on the remote host resolves to, so whether the path is in use cannot be told there.\n"+
-				"  The path is matched under the spelling its listener would have bound as well as the one given, and the\n"+
-				"  host could not do that resolution: readlink -f and realpath both failed on the directory, or answered\n"+
-				"  something that is not the same file. Nothing was removed.\n"+
-				"  Pass --remote-socket PATH to use a different path, or --skip-remote-check to start without the check\n"+
-				"  and accept that sshd may bind over a live agent socket.",
-			remoteSocket)
-	default: // socketUnjudgeable:远端没回答本检查所问的问题
-		return state, fmt.Errorf(
-			"could not tell whether %s on the remote host is in use: the host could not answer the questions the check turns on.\n"+
-				"  This is the verdict when ss is missing, fails, or prints something that is not a socket table,\n"+
-				"  when the kernel's /proc/net/unix cannot be read there - the probe reads those tables with grep\n"+
-				"  and sed, so a host without them answers the same way - and when the host's printf does not read\n"+
-				"  the \\NNN escapes the path travels as, which leaves the probe with no path to ask about.\n"+
+	case forwardDead:
+		removed, err := removeRemoteSocket(sshArgs, remoteSocket, run)
+		if err != nil {
+			return socketStuck, fmt.Errorf(
+				"a socket nothing is listening on is left at %s on the remote host, and removing it failed: %v.\n"+
+					"  Remove it there, or pass --remote-socket PATH to use a different path.",
+				remoteSocket, err)
+		}
+		if !removed {
+			return socketStuck, fmt.Errorf(
+				"a socket nothing is listening on is left at %s on the remote host, and it could not be removed.\n"+
+					"  Remove it there, or pass --remote-socket PATH to use a different path.",
+				remoteSocket)
+		}
+		return socketReclaimed, nil
+	default: // forwardUnjudgeable:没有得到关于该路径的判定
+		return socketUnjudgeable, fmt.Errorf(
+			"could not tell whether %s on the remote host is in use: the check could not make its connection.\n"+
 				"  Nothing was removed.\n"+
-				"  Remove the file there if nothing should be using it, pass --remote-socket PATH to use a different path,\n"+
-				"  or pass --skip-remote-check to start without the check and accept that sshd may bind over a live agent socket.",
+				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
 			remoteSocket)
 	}
+}
+
+// 删除path并丢弃判定与失败;用于控制socket,它是本检查自己的资源,不是判定的对象:
+// 删除失败留下的只是无人监听的socket,正是下次预检会回收的.
+func removeRemoteSocketBestEffort(sshArgs []string, path string, run SSHCommandRunner) {
+	_, _ = removeRemoteSocket(sshArgs, path, run)
 }
 
 // `sshWaitDelay`:ssh进程消失后Wait最多再等多久它的输出管道.ssh启动的命令可能比它活得久
@@ -495,8 +750,8 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, reclaim reclai
 const sshWaitDelay = 200 * time.Millisecond
 
 // `sshQueryTimeout`:一次性查询的时限,覆盖整次调用(含ssh自己的连接),发现连接与每个探针.
-// 远端只跑几条shell命令:探针读两张socket表.余量留给负载高的主机,
-// 20秒足够放弃完全不答的主机.预检跑在信号处理安装之前,不返回的查询无法被中断.
+// 远端只跑几条shell内建命令,工作量很小.余量留给负载高的主机,20秒足够,
+// 又不至于久等完全不答的主机.预检跑在信号处理安装之前,不返回的查询无法被中断.
 // 会话自己的ssh不受此限,它持续到会话结束.
 const sshQueryTimeout = 20 * time.Second
 

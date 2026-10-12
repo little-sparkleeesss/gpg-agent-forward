@@ -232,8 +232,8 @@ func TestParseSSHArgsConnectionFlags(t *testing.T) {
 			want: []string{"-p", "22"},
 		},
 		{
-			// ssh对标量取先读到的值, 而本包把`ClearAllForwardings=yes`放在用户参数之前: 用户的值
-			// 赢不了它. 键仍然被丢掉而不是留在向量里, 好让清空不只依赖这条规则.
+			// ssh对标量取先读到的值, 而本包把`ClearAllForwardings=yes`放在用户参数之前: 用户的
+			// 值赢不了它. 键仍然被丢掉而不是留在向量里, 好让清空不只依赖这条规则.
 			name: "the user's own ClearAllForwardings is dropped",
 			args: []string{"-o", "ClearAllForwardings=no", "-p", "22", "host"},
 			want: []string{"-p", "22"},
@@ -675,7 +675,7 @@ func TestCheckRemoteSocketFreeAcceptsAHostThatAnsweredBeforeThePipeWasHeld(t *te
 	requireStandInSSH(t)
 	t.Setenv("PATH", standInSSHPath(t, "echo "+socketAbsentMarker+"\n"+pipeHolder+"exit 0\n"))
 
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runSSHCommand)
 	if err != nil {
 		t.Fatalf("CheckRemoteSocketFree() error = %v, want nil: the probe answered", err)
 	}
@@ -705,12 +705,12 @@ func TestCheckRemoteSocketFreeStillRefusesWhenNothingWasReported(t *testing.T) {
 	requireStandInSSH(t)
 	t.Setenv("PATH", standInSSHPath(t, pipeHolder+"exit 0\n"))
 
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runSSHCommand)
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the probe reported nothing")
 	}
-	if state != socketUnreported {
-		t.Errorf("state = %v, want socketUnreported", state)
+	if state != socketUnjudgeable {
+		t.Errorf("state = %v, want socketUnjudgeable", state)
 	}
 	if !strings.Contains(err.Error(), "--skip-remote-check") {
 		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
@@ -781,9 +781,9 @@ func TestRunSSHQueryTruncationNeverReportsAFreePath(t *testing.T) {
 	// 主机先报路径被占用再猛刷, 被丢掉的恰好是结论那部分. 剩下的
 	// 是没结论, 必须拒绝; 若让其余输出冒充答案, 就会在已占用的路径上开会话.
 	requireStandInSSH(t)
-	t.Setenv("PATH", standInSSHPath(t, "echo "+socketLiveMarker+"\n"+noisyAnswer+"\n"))
+	t.Setenv("PATH", standInSSHPath(t, "echo "+socketUnknownMarker+"\n"+noisyAnswer+"\n"))
 
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", keepLeftover, runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", runSSHCommand)
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the verdict was dropped")
 	}
@@ -799,7 +799,7 @@ func TestCheckRemoteSocketFreeGivesUpOnAHostThatNeverAnswers(t *testing.T) {
 	t.Setenv("PATH", standInSSHPath(t, "sleep 30\n"))
 
 	start := time.Now()
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", keepLeftover, runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", runSSHCommand)
 	elapsed := time.Since(start)
 
 	if err == nil {

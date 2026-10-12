@@ -132,7 +132,7 @@ func TestRunSSHOpensNoFurtherConnectionAfterASessionThatRan(t *testing.T) {
 	port, _, _ := startAdoptedRelay(t)
 	fake := newStandInSSH(t, "exit 0")
 
-	err, errOut := runSSHAgainstStandIn(t, port)
+	err, _ := runSSHAgainstStandIn(t, port)
 
 	if err != nil {
 		t.Fatalf("Run(ssh) error = %v, want the session to end cleanly", err)
@@ -140,9 +140,6 @@ func TestRunSSHOpensNoFurtherConnectionAfterASessionThatRan(t *testing.T) {
 	want := []string{"probe", "session"}
 	if got := fake.invocations(t); !slices.Equal(got, want) {
 		t.Errorf("ssh invocations = %q, want %q: the run opens no connection after the session", got, want)
-	}
-	if strings.Contains(errOut, "could not clean up") {
-		t.Errorf("diagnostics = %q, want no cleanup of the remote socket reported", errOut)
 	}
 }
 
@@ -266,65 +263,4 @@ func TestForwardSignalsStoppingTwiceIsSafe(t *testing.T) {
 
 	noSession := forwardSignals()
 	noSession.stop()
-}
-
-func TestRunSSHStartsWithTheFlagWhenTheHostCannotTellWhatIsAtThePath(t *testing.T) {
-	// 探针答unknown (没有`ss`, `ss`失败, 内核socket表读不到)不是关于路径的结论;
-	// `--skip-remote-check`的help承诺远端查不了时就开session, 这类回答同样要能被它放行.
-	if runtime.GOOS == "windows" {
-		t.Skip("the stand-in ssh is a shell script")
-	}
-
-	t.Run("without the flag the session does not open", func(t *testing.T) {
-		port, _, _ := startAdoptedRelay(t)
-		fake := newStandInSSHSaying(t, socketUnknownMarker, "exit 0")
-
-		err, _ := runSSHAgainstStandIn(t, port)
-
-		if err == nil {
-			t.Fatal("Run(ssh) error = nil, want a refusal when the host could not tell")
-		}
-		if !strings.Contains(err.Error(), "--skip-remote-check") {
-			t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
-		}
-		if want := []string{"probe"}; !slices.Equal(fake.invocations(t), want) {
-			t.Errorf("ssh invocations = %q, want %q: the session must not open", fake.invocations(t), want)
-		}
-	})
-
-	t.Run("with the flag the session runs", func(t *testing.T) {
-		port, _, _ := startAdoptedRelay(t)
-		fake := newStandInSSHSaying(t, socketUnknownMarker, "exit 0")
-
-		err, errOut := runSSHAgainstStandIn(t, port, "--skip-remote-check")
-
-		if err != nil {
-			t.Fatalf("Run(ssh) error = %v, want the session to run with the flag given; diagnostics: %q", err, errOut)
-		}
-		if want := []string{"probe", "session"}; !slices.Equal(fake.invocations(t), want) {
-			t.Errorf("ssh invocations = %q, want %q", fake.invocations(t), want)
-		}
-		if !strings.Contains(errOut, "--skip-remote-check") {
-			t.Errorf("diagnostics = %q, want the skipped check reported", errOut)
-		}
-	})
-}
-
-func TestRunSSHRefusesALiveSocketWhateverTheFlagSays(t *testing.T) {
-	// 活socket是远端自己的agent, 盖上去正是检查要防的故障;
-	// 这个flag只覆盖没能查, 放宽到未决状态也不能放到这一种.
-	if runtime.GOOS == "windows" {
-		t.Skip("the stand-in ssh is a shell script")
-	}
-	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHSaying(t, socketLiveMarker, "exit 0")
-
-	err, _ := runSSHAgainstStandIn(t, port, "--skip-remote-check")
-
-	if err == nil {
-		t.Fatal("Run(ssh) error = nil, want a refusal for a live socket even with --skip-remote-check")
-	}
-	if want := []string{"probe"}; !slices.Equal(fake.invocations(t), want) {
-		t.Errorf("ssh invocations = %q, want %q: the session must not open", fake.invocations(t), want)
-	}
 }

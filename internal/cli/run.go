@@ -70,10 +70,6 @@ Common options:
                        (default: whatever gpgconf --list-dirs agent-socket reports)
   --skip-remote-check  ssh only: start the session even when the remote host
                        could not be asked about that path
-  --reclaim-remote-socket
-                       ssh only: remove a socket nothing is listening on at the
-                       remote path, instead of stopping and showing you the
-                       command that removes it there
 
 The relay exposes the agent's *extra* socket, which GnuPG documents for
 exactly this remote-forwarding case. It permits signing and decryption, and
@@ -82,15 +78,20 @@ and trust or event queries. Passphrase prompts and any card touch confirmation
 still appear on the Windows desktop, so a PIN never crosses the SSH link.
 
 A socket that nothing is listening on at the remote path is a leftover from a
-finished session, and it blocks the next one. gpg-agent-forward does not remove it by
-default, because the check that says nothing is listening there reads the
-remote host's own socket tables - the kernel's and ss's - and those describe
-one network namespace. A listener in another namespace, such as an agent in a
-container that shares the same directory, appears in neither, so the same
-answer covers a socket that is in use. Without --reclaim-remote-socket the
-session stops and the error carries the exact command that removes the file on
-the remote host. With it, the removal goes ahead and the risk that a socket in
-another namespace was in use is yours to accept.
+finished session, and it blocks the next one. gpg-agent-forward removes it before the
+session starts, so a finished session does not have to be cleaned up by hand.
+
+What it asks before removing anything is the remote host itself, not its socket
+tables. The check creates a socket next to the path and has the host connect to
+it, twice: once on a socket the check owns, to prove that this host on this
+connection permits such a connection at all, and once on the path itself. A
+connection that stays open and silent is a live listener, and the session
+stops: the path belongs to that host's own agent, and forwarding onto it would
+make gpg follow the wrong agent. A connection that closes without an answer,
+with that control in hand, is a leftover, and it is removed. The path is never
+removed when it cannot be written, when it is not a socket, or when the host
+cannot be asked or cannot answer - those all stop the session. --skip-remote-check
+is how the last group is started anyway, knowingly.
 `)
 }
 
@@ -170,8 +171,6 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 		"socket path to create on the remote host (default: ask the remote for `gpgconf --list-dirs agent-socket`)")
 	skipRemoteCheck := fs.Bool("skip-remote-check", false,
 		"start the session even when the remote host could not be checked for a live socket at that path")
-	reclaimRemoteSocket := fs.Bool("reclaim-remote-socket", false,
-		"remove a socket nothing is listening on at the remote path instead of stopping to tell you about it")
 	// idle选项被接受但忽略: ssh会话用的relay总是禁用idle, 因为relay无法感知
 	// 会话结束; 这里必须消费掉它, 否则会透传给ssh而被它拒绝, 会话根本起不来.
 	fs.Duration("idle", 0,
@@ -200,23 +199,18 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	}
 
 	// 拒绝覆盖远端主机自己的agent socket: 否则首次连接会顺带启动那个agent, gpg会静默用远端密钥签名.
-	// 残留socket只在用户要求 (`--reclaim-remote-socket`) 时才删并报告; 否则停下, 错误里给出删除命令.
-	// 判据是远端socket表, 只描述一个network namespace, 分不清残留和共享目录的容器里的agent.
-	// 探针跑不起来, 判不了路径或说不清解析结果的拒绝; `--skip-remote-check`明知风险放行, 有结论不放行.
-	reclaim := keepLeftover
-	if *reclaimRemoteSocket {
-		reclaim = reclaimLeftover
-	}
-	remoteState, err := CheckRemoteSocketFree(sshArgs, *remoteSocket, reclaim, runSSHCommand)
-	unchecked := err != nil && *skipRemoteCheck &&
-		(remoteState == socketUnreported || remoteState == socketUnjudgeable || remoteState == socketUnresolved)
+	// 无人监听的socket是残留, 挡着bind又没服务, 这里直接删掉让会话起来.
+	// 判据不是socket表而是远端主机本身: 回连无应答且有对照连接证明才算残留 (详见classifyRemoteSocket).
+	// 问不到或答不了的一律拒绝, `--skip-remote-check`明知风险放行, 有结论的不放行.
+	remoteState, err := CheckRemoteSocketFree(sshArgs, *remoteSocket, runSSHCommand)
+	unchecked := err != nil && *skipRemoteCheck && remoteState == socketUnjudgeable
 	if err != nil && !unchecked {
 		return err
 	}
 	switch remoteState {
 	case socketReclaimed:
 		fmt.Fprintf(stderr, "gpg-agent-forward: removed a leftover socket nothing was listening on at %s on the remote host\n", *remoteSocket)
-	case socketUnreported, socketUnjudgeable, socketUnresolved:
+	case socketUnjudgeable:
 		if unchecked {
 			fmt.Fprintf(stderr, "gpg-agent-forward: --skip-remote-check: starting without checking what is at %s on the remote host\n", *remoteSocket)
 		}

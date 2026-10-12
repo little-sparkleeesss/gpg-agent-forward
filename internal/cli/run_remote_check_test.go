@@ -30,36 +30,43 @@ func TestSplitSSHArgsKeepsTheDestinationAfterASwitch(t *testing.T) {
 	if want := []string{"-p", "2222", "dev@host"}; !slices.Equal(through, want) {
 		t.Errorf("through = %q, want %q", through, want)
 	}
-
-	// `--reclaim-remote-socket`是同类开关, 同样必须在这里消费掉:
-	// ssh不认这个选项, 会拒绝启动session.
-	own, through = SplitSSHArgs([]string{"--reclaim-remote-socket", "dev@host"})
-	if want := []string{"--reclaim-remote-socket"}; !slices.Equal(own, want) {
-		t.Errorf("own = %q, want %q", own, want)
-	}
-	if want := []string{"dev@host"}; !slices.Equal(through, want) {
-		t.Errorf("through = %q, want %q", through, want)
-	}
 }
 
-// 替身ssh按探针命令里带的marker作答: 带reclaim marker的说明开关传到了远端命令;
-// 一律同样作答的替身看不出哪套策略到了远端, 而开关只有到得了远端才算接对.
-func newStandInSSHForReclaim(t *testing.T) *standInSSH {
+// 替身ssh对run的每种调用分别作答, 结果可按调用内容区分:
+// 带`socketAbsentMarker`的form命令回`formMarker`; 带rm的删除分两条 - control socket
+// 那条回`socketReclaimedMarker`, 被测路径那条回`removalMarker`; 其余是session.
+func newStandInSSHForForm(t *testing.T, formMarker, removalMarker string) *standInSSH {
 	t.Helper()
 	dir := t.TempDir()
 	f := &standInSSH{
 		log:     filepath.Join(dir, "invocations"),
 		started: filepath.Join(dir, "session-started"),
 	}
+	form := ":"
+	if formMarker != "" {
+		form = "echo " + formMarker
+	}
+	removal := "echo " + socketReclaimedMarker
+	if removalMarker != "" {
+		removal = "echo " + removalMarker
+	}
 	script := fmt.Sprintf(`#!/bin/sh
 case "$*" in
   *%s*)
     echo probe >> %s
-    echo %s
+    %s
     ;;
-  *%s*)
-    echo probe >> %s
-    echo %s
+  *rm\ -f*)
+    case "$*" in
+      *%s*)
+        echo ctl >> %s
+        echo %s
+        ;;
+      *)
+        echo remove >> %s
+        %s
+        ;;
+    esac
     ;;
   *)
     echo session >> %s
@@ -68,8 +75,9 @@ case "$*" in
     ;;
 esac
 `,
-		socketReclaimedMarker, shellQuoteSingle(f.log), socketReclaimedMarker,
-		socketStaleMarker, shellQuoteSingle(f.log), socketStaleMarker,
+		socketAbsentMarker, shellQuoteSingle(f.log), form,
+		casePatternFor(octalEscapes("/"+controlSocketPrefix)), shellQuoteSingle(f.log), socketReclaimedMarker,
+		shellQuoteSingle(f.log), removal,
 		shellQuoteSingle(f.log), shellQuoteSingle(f.started))
 	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
 		t.Fatalf("write the stand-in ssh: %v", err)
@@ -78,133 +86,214 @@ esac
 	return f
 }
 
-func TestRunSSHStopsAtASocketLeftOnTheRemoteHost(t *testing.T) {
-	// 无人监听的socket也要用户要求才删: 证据只来自一个network namespace的socket表,
-	// 另一个namespace里的agent(共享目录的容器)看不到. 错误里同时给出删除命令和开关.
+// 把run的探测接起来: form命令由`PATH`上的替身ssh作答, 分类结果换成测试选定的值.
+// 分类是唯一需要真ssh连接的部分, 详见`remote_probe_test.go`.
+func withFormAndClassification(t *testing.T, verdict socketForwardVerdict, err error) {
+	t.Helper()
+	old := classifyRemoteSocketForward
+	classifyRemoteSocketForward = func([]string, string, string) (socketForwardVerdict, error) {
+		return verdict, err
+	}
+	t.Cleanup(func() { classifyRemoteSocketForward = old })
+}
+
+// 把`s`转义后用作shell case pattern: 远端命令里带的是八进制转义,
+// 不转义的话每个反斜杠会被pattern当成引用符.
+func casePatternFor(s string) string {
+	return strings.ReplaceAll(s, `\`, `\\`)
+}
+
+// 滤掉control socket自身的清理记录: 检查无论结论如何都会删自己的控制socket,
+// 那些行对断言被测路径上的处理是噪声.
+func checkInvocations(t *testing.T, f *standInSSH) []string {
+	t.Helper()
+	var kept []string
+	for _, got := range f.invocations(t) {
+		if got == "ctl" {
+			continue
+		}
+		kept = append(kept, got)
+	}
+	return kept
+}
+
+func TestRunSSHStartsWithTheFlagWhenTheHostCannotBeChecked(t *testing.T) {
+	// form命令没报告, 路径上有什么无从得知; 此时仍开session会顶掉活着的agent socket.
+	// `--skip-remote-check`是显式通道: session照开, 并报告没做检查.
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in ssh is a shell script")
 	}
 	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHForReclaim(t)
+	fake := newStandInSSHForForm(t, "", "")
 
 	err, _ := runSSHAgainstStandIn(t, port)
 
 	if err == nil {
-		t.Fatal("Run(ssh) error = nil, want a refusal for a socket left at the remote path")
+		t.Fatal("Run(ssh) error = nil, want a refusal when the remote host answered nothing")
 	}
-	if !strings.Contains(err.Error(), "--reclaim-remote-socket") {
-		t.Errorf("error %v should name --reclaim-remote-socket as the way to have it removed", err)
+	if !strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
 	}
-	const want = "rm -f -- '/run/user/1000/gnupg/S.gpg-agent'"
-	if !strings.Contains(err.Error(), want) {
-		t.Errorf("error %v should carry %q, the command that removes the file on the remote host", err, want)
+	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake), want) {
+		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
 	}
-	if got := fake.invocations(t); !slices.Equal(got, []string{"probe"}) {
-		t.Errorf("ssh invocations = %q, want [probe]: the session must not open", got)
+
+	port2, _, _ := startAdoptedRelay(t)
+	fake2 := newStandInSSHForForm(t, "", "")
+	err, errOut := runSSHAgainstStandIn(t, port2, "--skip-remote-check")
+	if err != nil {
+		t.Fatalf("Run(ssh) error = %v, want the session to run with the flag given; diagnostics: %q", err, errOut)
+	}
+	if want := []string{"probe", "session"}; !slices.Equal(checkInvocations(t, fake2), want) {
+		t.Errorf("ssh invocations = %q, want %q", checkInvocations(t, fake2), want)
+	}
+	if !strings.Contains(errOut, "--skip-remote-check") {
+		t.Errorf("diagnostics = %q, want the skipped check reported", errOut)
 	}
 }
 
-func TestRunSSHRefusesALeftoverSocketWhateverTheFlagSays(t *testing.T) {
-	// 留下socket是已经得出的结论, `--skip-remote-check`只代表没能查, 不能越过它:
-	// 越过要靠错误里的命令或`--reclaim-remote-socket`; 放行它会在刚报告被占用的
-	// 路径上开session, 而用户还没对删除做决定.
+func TestRunSSHRefusesALiveSocketWhateverTheFlagSays(t *testing.T) {
+	// 活socket是远端自己的agent, 盖上去正是检查要防的故障;
+	// `--skip-remote-check`只覆盖没能查, 放宽到未决状态也不能放到这一种.
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in ssh is a shell script")
 	}
 	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHForReclaim(t)
+	fake := newStandInSSHForForm(t, socketSocketMarker, socketReclaimedMarker)
+	withFormAndClassification(t, forwardLive, nil)
 
 	err, _ := runSSHAgainstStandIn(t, port, "--skip-remote-check")
 
 	if err == nil {
-		t.Fatal("Run(ssh) error = nil, want a refusal for a socket left at the remote path even with --skip-remote-check")
+		t.Fatal("Run(ssh) error = nil, want a refusal for a live socket even with --skip-remote-check")
 	}
-	if !strings.Contains(err.Error(), "--reclaim-remote-socket") {
-		t.Errorf("error %v should name --reclaim-remote-socket as the way to have the leftover removed", err)
-	}
-	if got := fake.invocations(t); !slices.Equal(got, []string{"probe"}) {
-		t.Errorf("ssh invocations = %q, want [probe]: --skip-remote-check must not open a session on a verdict", got)
+	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake), want) {
+		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
 	}
 }
 
-func TestRunSSHReclaimsASocketLeftOnTheRemoteHostWhenAsked(t *testing.T) {
-	// 带`--reclaim-remote-socket`时删除并报告: 对远端的改动必须让用户看得见.
+// 无人监听的残留socket默认即删, 无需开关; 删除被报告, session照开.
+func TestRunSSHStartsAfterReclaimingALeftover(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in ssh is a shell script")
 	}
 	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHForReclaim(t)
+	fake := newStandInSSHForForm(t, socketSocketMarker, socketReclaimedMarker)
+	withFormAndClassification(t, forwardDead, nil)
 
-	err, errOut := runSSHAgainstStandIn(t, port, "--reclaim-remote-socket")
+	err, errOut := runSSHAgainstStandIn(t, port)
 
 	if err != nil {
-		t.Fatalf("Run(ssh) error = %v, want the session to run with the switch given; diagnostics: %q", err, errOut)
+		t.Fatalf("Run(ssh) error = %v, want the session to run; diagnostics: %q", err, errOut)
 	}
-	// 替身只对带开关的探针命令回reclaimed, 所以session开起来就证明开关到了探针;
-	// 只有pre-check会探: session之后不再开任何连接.
-	if got := fake.invocations(t); !slices.Equal(got, []string{"probe", "session"}) {
-		t.Errorf("ssh invocations = %q, want [probe session]", got)
+	// 两次删除是设计使然: 一次删被测路径, 一次删检查自己建的控制socket.
+	if want := []string{"probe", "remove", "session"}; !slices.Equal(checkInvocations(t, fake), want) {
+		t.Errorf("ssh invocations = %q, want %q", checkInvocations(t, fake), want)
 	}
 	if !strings.Contains(errOut, "removed a leftover socket") {
 		t.Errorf("diagnostics = %q, want the removal reported", errOut)
 	}
 }
 
-func TestRunHelpNamesTheReclaimSwitch(t *testing.T) {
-	// 拒绝信息点名了开关, help里就必须有它: 查不到的开关, 用户没法据以决定;
-	// help还要说明它接受什么, 因为默认保留文件的原因不在开关名字里.
+// 删除本身的结果才是最后答案: 目录不可写时connect也会被拒,
+// 所以没有应答不构成启动的许可.
+func TestRunSSHStopsWhenTheLeftoverCannotBeRemoved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSHForForm(t, socketSocketMarker, socketStuckMarker)
+	withFormAndClassification(t, forwardDead, nil)
+
+	err, _ := runSSHAgainstStandIn(t, port)
+
+	if err == nil {
+		t.Fatal("Run(ssh) error = nil, want a refusal when the leftover could not be removed")
+	}
+	// 答案来自那次删除尝试; session不会跟着打开.
+	if want := []string{"probe", "remove"}; !slices.Equal(checkInvocations(t, fake), want) {
+		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
+	}
+}
+
+// `Run`层的fail-closed核心: 拒绝stream-local forwarding的`sshd`会让活socket看着也像死的,
+// 所以分不出类时必须停在原地, 不能开session.
+func TestRunSSHStopsWhenTheClassificationCannotBeMade(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSHForForm(t, socketSocketMarker, socketReclaimedMarker)
+	withFormAndClassification(t, forwardUnjudgeable, fmt.Errorf("the control connection was not established"))
+
+	err, _ := runSSHAgainstStandIn(t, port)
+
+	if err == nil {
+		t.Fatal("Run(ssh) error = nil, want a refusal when the check cannot tell")
+	}
+	if !strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
+	}
+	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake), want) {
+		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
+	}
+
+	port2, _, _ := startAdoptedRelay(t)
+	fake2 := newStandInSSHForForm(t, socketSocketMarker, socketReclaimedMarker)
+	withFormAndClassification(t, forwardUnjudgeable, fmt.Errorf("the control connection was not established"))
+	err, errOut := runSSHAgainstStandIn(t, port2, "--skip-remote-check")
+	if err != nil {
+		t.Fatalf("Run(ssh) error = %v, want the session to run; diagnostics: %q", err, errOut)
+	}
+	if want := []string{"probe", "session"}; !slices.Equal(checkInvocations(t, fake2), want) {
+		t.Errorf("ssh invocations = %q, want %q", checkInvocations(t, fake2), want)
+	}
+	if !strings.Contains(errOut, "--skip-remote-check") {
+		t.Errorf("diagnostics = %q, want the skipped check reported", errOut)
+	}
+}
+
+// 权限关口: 连socket需要写权限, 权限被拒与无人监听在连接层同样是关闭, 无从区分,
+// 所以先在远端正面测权限, 默认是拒绝而不是删除. `--skip-remote-check`确实能放行这里,
+// 这是刻意的: 路径判不了正是该开关的用途; 代价是`sshd`的bind可能unlink别人的socket.
+func TestRunSSHStopsAtAPathItCannotWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	port, _, _ := startAdoptedRelay(t)
+	fake := newStandInSSHForForm(t, socketUnwritableMarker, "")
+
+	err, _ := runSSHAgainstStandIn(t, port)
+
+	if err == nil {
+		t.Fatal("Run(ssh) error = nil, want a refusal for a path this user cannot write")
+	}
+	if !strings.Contains(err.Error(), "cannot be written") {
+		t.Errorf("error %v should say the path cannot be written", err)
+	}
+	if !strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error %v should name --skip-remote-check as the deliberate way to start anyway", err)
+	}
+	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake), want) {
+		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
+	}
+}
+
+func TestRunHelpNamesTheCheckAndNotAReclaimSwitch(t *testing.T) {
+	// 帮助要说明检查做什么: 删除现在是默认行为, 它为何安全从命令行看不出来.
+	// 需要用户主动选择的reclaim开关已删除, 没有可opt in的东西了.
 	var out, errOut bytes.Buffer
 	if err := Run([]string{"--help"}, &out, &errOut); err != nil {
 		t.Fatalf("Run(--help) error = %v, want nil", err)
 	}
 	help := out.String()
-	if !strings.Contains(help, "--reclaim-remote-socket") {
-		t.Errorf("help does not list --reclaim-remote-socket:\n%s", help)
+	if !strings.Contains(help, "--skip-remote-check") {
+		t.Errorf("help does not list --skip-remote-check:\n%s", help)
 	}
-	if !strings.Contains(help, "namespace") {
-		t.Errorf("help does not say that the evidence covers one network namespace, which is what the switch accepts:\n%s", help)
+	if strings.Contains(help, "reclaim-remote-socket") {
+		t.Errorf("help still lists --reclaim-remote-socket, which no longer exists:\n%s", help)
 	}
-}
-
-func TestRunSSHRefusesAHostItCannotCheck(t *testing.T) {
-	// 探针没有报告, 路径上有什么无从得知; 此时仍开session会顶掉活着的agent socket.
-	// 所以在这里停下, 并给出显式接受这个风险的办法.
-	if runtime.GOOS == "windows" {
-		t.Skip("the stand-in ssh is a shell script")
-	}
-	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHSaying(t, "", "exit 0")
-
-	err, _ := runSSHAgainstStandIn(t, port)
-
-	if err == nil {
-		t.Fatal("Run(ssh) error = nil, want a refusal when the remote host could not be checked")
-	}
-	if !strings.Contains(err.Error(), "--skip-remote-check") {
-		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
-	}
-	if want := []string{"probe"}; !slices.Equal(fake.invocations(t), want) {
-		t.Errorf("ssh invocations = %q, want %q: the session must not open", fake.invocations(t), want)
-	}
-}
-
-func TestRunSSHStartsWithTheFlagWhenTheHostCannotBeChecked(t *testing.T) {
-	// `--skip-remote-check`是主机查不了时的显式通道: session照开, 并明确说出没做检查.
-	if runtime.GOOS == "windows" {
-		t.Skip("the stand-in ssh is a shell script")
-	}
-	port, _, _ := startAdoptedRelay(t)
-	fake := newStandInSSHSaying(t, "", "exit 0")
-
-	err, errOut := runSSHAgainstStandIn(t, port, "--skip-remote-check")
-
-	if err != nil {
-		t.Fatalf("Run(ssh) error = %v, want the session to run with the flag given; diagnostics: %q", err, errOut)
-	}
-	if want := []string{"probe", "session"}; !slices.Equal(fake.invocations(t), want) {
-		t.Errorf("ssh invocations = %q, want %q", fake.invocations(t), want)
-	}
-	if !strings.Contains(errOut, "--skip-remote-check") {
-		t.Errorf("diagnostics = %q, want the skipped check reported", errOut)
+	if !strings.Contains(help, "removes it") && !strings.Contains(help, "is removed") {
+		t.Errorf("help does not say that a leftover socket is removed:\n%s", help)
 	}
 }

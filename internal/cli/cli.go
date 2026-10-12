@@ -16,7 +16,7 @@ const DefaultRelayPort = 29173
 // 路径里的一个字节决定. 用户没配`ExitOnForwardFailure`时补上: 缺了它失败静默, ssh只
 // 警告并保持会话, 签名会悄悄改用远端主机上的agent, 用户却拿到有效签名, 想不到YubiKey从未参与.
 func BuildSSHArgs(userArgs []string, remoteSocket string, port int) []string {
-	spec := fmt.Sprintf("%s:127.0.0.1:%d", escapePercent(remoteSocket), port)
+	spec := fmt.Sprintf("%s:127.0.0.1:%d", percentEscape(remoteSocket), port)
 	args := make([]string, 0, len(userArgs)+4)
 	args = append(args, "-R", spec)
 	if !userSetForwardFailure(userArgs) {
@@ -26,8 +26,8 @@ func BuildSSHArgs(userArgs []string, remoteSocket string, port int) []string {
 	return args
 }
 
-// ssh的token展开里, 字面的百分号要写成两个.
-func escapePercent(s string) string {
+// ssh的token展开里字面百分号写作两个; 进`-L`/`-R`参数的路径都要转义, ssh在那里也展开.
+func percentEscape(s string) string {
 	return strings.ReplaceAll(s, "%", "%%")
 }
 
@@ -60,10 +60,8 @@ var sshOwnFlags = map[string]bool{
 
 // 开关选项单列: `sshOwnFlags`会把后一个参数当值消费, 混进去会吞掉目标主机.
 var sshOwnBoolFlags = map[string]bool{
-	"-skip-remote-check":      true,
-	"--skip-remote-check":     true,
-	"-reclaim-remote-socket":  true,
-	"--reclaim-remote-socket": true,
+	"-skip-remote-check":  true,
+	"--skip-remote-check": true,
 }
 
 // ssh自带`-N`, `-p`, `-i`, `-o`, 交给通用flag解析器会被拒; 这里只消费自己认识的选项,
@@ -122,12 +120,12 @@ func ValidatePort(port int) error {
 	return nil
 }
 
-// 拒绝ssh会读错的远端socket路径, 也拒绝过不了远端登录shell的路径: 冒号会被解析成
-// 地址分隔符, 超长则越过两端都强制的`sockaddr_un`上限(含终止符108字节, 可用107).
-// 控制字符同理: 换行会让交给远端登录shell的单行探针散成多行, `csh`/`tcsh`拒绝跨行的
-// 引号词而什么都不跑, 调用方只能读成问不到主机; 其余C0控制符与DEL还会破坏路径与远端
-// 回报地址的匹配, 详见`remoteSocketProbe`; 空格和单引号合法, 探针会为远端shell给路径加引号,
-// 本检查先于构造探针; 百分号同理, 由`BuildSSHArgs`转义而不是在这里拒绝.
+// 拒绝ssh会读错的远端socket路径, 也拒绝过不了远端登录shell的路径: 冒号会在路径经过的
+// `-L`/`-R`里被解析成地址分隔符, 超长则越过两端都强制的`sun_path`上限(含终止符108
+// 字节, 可用107). 控制字符同理: `remoteSocketForm`的单行远端命令遇换行会散成多行,
+// `csh`/`tcsh`拒绝跨行的引号词而什么都不跑, 调用方只能读成问不到主机; 其余C0控制符
+// 与DEL一并拒绝, 详见`remoteSocketForm`; 空格和单引号合法, 本检查先于任何命令构造;
+// 百分号同理, 由`percentEscape`转义而不是在这里拒绝.
 func ValidateRemoteSocket(p string) error {
 	if p == "" {
 		return fmt.Errorf("remote socket path is empty")
@@ -137,7 +135,7 @@ func ValidateRemoteSocket(p string) error {
 			return fmt.Errorf("remote socket path %q must not contain ':'", p)
 		}
 		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("remote socket path %q must not contain the control character %q (U+%04X): the remote probe is a single-line command, so a path like this makes it run as several lines (csh and tcsh reject that) and stops it matching the addresses the remote host reports", p, r, r)
+			return fmt.Errorf("remote socket path %q must not contain the control character %q (U+%04X): the remote command that reports what is at the path is a single-line command, so a path like this makes it run as several lines (csh and tcsh reject that)", p, r, r)
 		}
 	}
 	if len(p) >= 108 {
