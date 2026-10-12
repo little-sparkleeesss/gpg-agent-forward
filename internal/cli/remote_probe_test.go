@@ -151,7 +151,7 @@ func socketFileExists(t *testing.T, path string) bool {
 func TestRemoteSocketProbeCommandIsOneLine(t *testing.T) {
 	// sshd先把命令交给远端登录shell: `csh`/`tcsh`对跨行的引号串报"Unmatched '",
 	// 之后什么都不跑, 故多行命令的探针报不出结论.
-	cmd := remoteSocketProbe("/run/user/1000/gnupg/S.gpg-agent")
+	cmd := remoteSocketProbe("/run/user/1000/gnupg/S.gpg-agent", keepLeftover)
 	if strings.ContainsAny(cmd, "\n\r") {
 		t.Errorf("probe %q spans lines, which the remote login shell refuses to parse", cmd)
 	}
@@ -167,7 +167,7 @@ func TestRemoteSocketProbeCommandRunsUnderTcsh(t *testing.T) {
 		t.Skip("tcsh is not installed; TestRemoteSocketProbeCommandIsOneLine covers the shape it rejects")
 	}
 	path := filepath.Join(t.TempDir(), "S.gpg-agent")
-	out, err := exec.Command(tcsh, "-f", "-c", remoteSocketProbe(path)).Output()
+	out, err := exec.Command(tcsh, "-f", "-c", remoteSocketProbe(path, keepLeftover)).Output()
 	if err != nil {
 		t.Fatalf("tcsh could not run the probe: %v (output %q)", err, out)
 	}
@@ -181,7 +181,7 @@ func TestRemoteSocketProbeSeesAnAbsentPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "S.gpg-agent")
 
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(os.Getenv("PATH")))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(os.Getenv("PATH")))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -191,7 +191,7 @@ func TestRemoteSocketProbeSeesAnAbsentPath(t *testing.T) {
 	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
 		t.Errorf("the probe left %v behind at a path that did not exist: %v", entries, err)
 	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(os.Getenv("PATH"))); err != nil {
+	if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(os.Getenv("PATH"))); err != nil {
 		t.Errorf("CheckRemoteSocketFree() error = %v, want the session to start", err)
 	}
 }
@@ -220,11 +220,12 @@ func pathWithoutSS(t *testing.T, extra ...string) string {
 }
 
 func TestRemoteSocketProbeReclaimsADeadSocket(t *testing.T) {
+	// 死socket本就该删, 这里显式要它: 这就是`--reclaim-remote-socket`买到的行为.
 	requireShell(t)
 	path := filepath.Join(t.TempDir(), "S.gpg-agent")
 	deadSocketAt(t, path)
 
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssPathForProbe(t)))
+	state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, localProbeRunner(ssPathForProbe(t)))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -235,9 +236,43 @@ func TestRemoteSocketProbeReclaimsADeadSocket(t *testing.T) {
 		t.Errorf("%s is still there: a dead socket blocks the next session's bind", path)
 	}
 	deadSocketAt(t, path)
-	state, err = CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(ssPathForProbe(t)))
+	state, err = CheckRemoteSocketFree([]string{"host"}, path, reclaimLeftover, localProbeRunner(ssPathForProbe(t)))
 	if err != nil || state != socketReclaimed {
 		t.Errorf("CheckRemoteSocketFree() = (%v, %v), want (socketReclaimed, nil)", state, err)
+	}
+}
+
+func TestRemoteSocketProbeLeavesALeftoverSocketInPlace(t *testing.T) {
+	// 不用开关: 死socket只报告不删除. 两张表只覆盖一个网络命名空间,
+	// 共享目录的容器里的agent两张表都看不到, 同样的证据会误删在用的socket.
+	// 分不清两者就一律拒绝, 并把推翻此判断的途径交给调用方.
+	requireShell(t)
+	path := filepath.Join(t.TempDir(), "S.gpg-agent")
+	deadSocketAt(t, path)
+
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
+	if err != nil {
+		t.Fatalf("probeRemoteSocket() error = %v", err)
+	}
+	if state != socketStale {
+		t.Fatalf("state = %v, want socketStale for a socket nothing listens on and no permission to remove it", state)
+	}
+	if !socketFileExists(t, path) {
+		t.Fatalf("%s was removed without --reclaim-remote-socket", path)
+	}
+	// 拒绝必须可操作: 点名开关, 并带上能在远端删掉这个文件的命令.
+	_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a socket left behind")
+	}
+	if !strings.Contains(err.Error(), "--reclaim-remote-socket") {
+		t.Errorf("error %v should name --reclaim-remote-socket", err)
+	}
+	if want := "rm -f -- " + shellQuoteSingle(path); !strings.Contains(err.Error(), want) {
+		t.Errorf("error %v should carry %q, a command the user can paste on the remote host", err, want)
+	}
+	if !socketFileExists(t, path) {
+		t.Errorf("%s was removed by the refusal path", path)
 	}
 }
 
@@ -247,7 +282,7 @@ func TestRemoteSocketProbeLeavesALiveSocketAlone(t *testing.T) {
 	l := listenAt(t, path)
 	defer l.Close()
 
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssPathForProbe(t)))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -263,7 +298,7 @@ func TestRemoteSocketProbeLeavesALiveSocketAlone(t *testing.T) {
 	} else {
 		c.Close()
 	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(ssPathForProbe(t))); err == nil {
+	if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t))); err == nil {
 		t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
 	}
 }
@@ -276,7 +311,7 @@ func TestRemoteSocketProbeLeavesAPlainFileAlone(t *testing.T) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssPathForProbe(t)))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -300,7 +335,7 @@ func TestRemoteSocketProbeReportsASymlinkAsUndecidable(t *testing.T) {
 		t.Fatalf("symlink %s: %v", path, err)
 	}
 
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssPathForProbe(t)))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -315,7 +350,7 @@ func TestRemoteSocketProbeReportsASymlinkAsUndecidable(t *testing.T) {
 		t.Errorf("the listener's own socket at %s was removed", target)
 	}
 	// 错误必须说真正的原因: 怪到`ss`头上会让用户查错方向.
-	_, err = CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(ssPathForProbe(t)))
+	_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPathForProbe(t)))
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a symbolic link")
 	}
@@ -336,7 +371,7 @@ func TestRemoteSocketProbeIsUndecidedWithoutSS(t *testing.T) {
 	deadSocketAt(t, path)
 
 	noSS := pathWithoutSS(t, "tr")
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(noSS))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(noSS))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -357,7 +392,7 @@ func TestRemoteSocketProbeNamesALiveSocketWithoutSS(t *testing.T) {
 	defer l.Close()
 
 	noSS := pathWithoutSS(t, "tr")
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(noSS))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(noSS))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -367,7 +402,7 @@ func TestRemoteSocketProbeNamesALiveSocketWithoutSS(t *testing.T) {
 	if !socketFileExists(t, path) {
 		t.Fatal("a live socket was removed on a host whose probe never mentioned it")
 	}
-	_, err = CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(noSS))
+	_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(noSS))
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
 	}
@@ -387,7 +422,7 @@ func TestRemoteSocketProbeDoesNotRemoveWhenSSFails(t *testing.T) {
 		l := listenAt(t, path)
 		defer l.Close()
 
-		state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssPath))
+		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath))
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -404,7 +439,7 @@ func TestRemoteSocketProbeDoesNotRemoveWhenSSFails(t *testing.T) {
 		} else {
 			c.Close()
 		}
-		if _, err := CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(ssPath)); err == nil {
+		if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath)); err == nil {
 			t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path that is in use")
 		}
 	})
@@ -413,7 +448,7 @@ func TestRemoteSocketProbeDoesNotRemoveWhenSSFails(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "S.gpg-agent")
 		deadSocketAt(t, path)
 
-		state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssPath))
+		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath))
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -432,7 +467,7 @@ func TestRemoteSocketProbeTellsUnknownWhenSSPrintsNothing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "S.gpg-agent")
 	deadSocketAt(t, path)
 
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssStub(t, "")))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssStub(t, "")))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -457,7 +492,7 @@ func TestRemoteSocketProbeRefusesToBelieveASingleSource(t *testing.T) {
 		l := listenAt(t, path)
 		defer l.Close()
 
-		state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(lyingSS))
+		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(lyingSS))
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -473,7 +508,7 @@ func TestRemoteSocketProbeRefusesToBelieveASingleSource(t *testing.T) {
 		} else {
 			c.Close()
 		}
-		if _, err := CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(lyingSS)); err == nil {
+		if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(lyingSS)); err == nil {
 			t.Error("CheckRemoteSocketFree() error = nil, want the live verdict surfaced as a refusal")
 		}
 	})
@@ -486,7 +521,7 @@ func TestRemoteSocketProbeRefusesToBelieveASingleSource(t *testing.T) {
 		defer l.Close()
 
 		run := replaceProbeSource(localProbeRunner(lyingSS), procNetUnixPath, procTableStub(t, procTableHeader+"\n"))
-		state, err := probeRemoteSocket([]string{"host"}, path, run)
+		state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, run)
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -498,13 +533,13 @@ func TestRemoteSocketProbeRefusesToBelieveASingleSource(t *testing.T) {
 		}
 	})
 
-	t.Run("a dead socket is still removed when both sources omit it", func(t *testing.T) {
-		// 交叉核对不是拒绝清理: 两张表都没列出的socket照旧被回收.
+	t.Run("the same stub reclaims a dead socket when both sources omit it", func(t *testing.T) {
+		// 交叉核对不是拒绝清理: 两张表都没列出的socket, 调用方要求的删除照旧执行.
 		// 复用的替身对死socket打印的表与诚实`ss`无异.
 		path := filepath.Join(t.TempDir(), "S.gpg-agent")
 		deadSocketAt(t, path)
 
-		state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(lyingSS))
+		state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, localProbeRunner(lyingSS))
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -529,7 +564,7 @@ func TestRemoteSocketProbeIsUndecidedWithoutTheKernelTable(t *testing.T) {
 
 		// 空目录里的路径, 对脚本来说就是`/proc/net/unix`未挂载或读不到的样子.
 		run := replaceProbeSource(localProbeRunner(ssStub(t, ssHeader)), procNetUnixPath, missingProcTable(t))
-		state, err := probeRemoteSocket([]string{"host"}, path, run)
+		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, run)
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -540,7 +575,7 @@ func TestRemoteSocketProbeIsUndecidedWithoutTheKernelTable(t *testing.T) {
 			t.Fatal("the probe removed a live socket with only ss to speak for it")
 		}
 		// 拒绝要给出绕过它的路: `/proc/net/unix`被屏蔽的主机, 用户仍可能想用.
-		_, err = CheckRemoteSocketFree([]string{"host"}, path, run)
+		_, err = CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, run)
 		if err == nil {
 			t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal while one source is missing")
 		}
@@ -555,7 +590,7 @@ func TestRemoteSocketProbeIsUndecidedWithoutTheKernelTable(t *testing.T) {
 		deadSocketAt(t, path)
 
 		run := replaceProbeSource(localProbeRunner(ssPathForProbe(t)), procNetUnixPath, missingProcTable(t))
-		state, err := probeRemoteSocket([]string{"host"}, path, run)
+		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, run)
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -586,7 +621,7 @@ func TestRemoteSocketProbeFindsALiveSocketWhosePathSSEscapes(t *testing.T) {
 	escaped := strings.ReplaceAll(path, " ", `\x20`)
 	ssPath := ssStub(t, ssHeader+"\nu_str LISTEN 0 4096 "+escaped+" 4242 * 0")
 
-	state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssPath))
+	state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath))
 	if err != nil {
 		t.Fatalf("probeRemoteSocket() error = %v", err)
 	}
@@ -596,7 +631,7 @@ func TestRemoteSocketProbeFindsALiveSocketWhosePathSSEscapes(t *testing.T) {
 	if !socketFileExists(t, path) {
 		t.Fatal("the probe removed a live socket because ss escaped the space in its path")
 	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, path, localProbeRunner(ssPath)); err == nil {
+	if _, err := CheckRemoteSocketFree([]string{"host"}, path, keepLeftover, localProbeRunner(ssPath)); err == nil {
 		t.Error("CheckRemoteSocketFree() error = nil, want a refusal for a path in use")
 	}
 }
@@ -616,7 +651,7 @@ func TestRemoteSocketProbeMatchesWholeAddressFields(t *testing.T) {
 			"u_str LISTEN 0 4096 /tmp/x" + path + "y 4243 * 0",
 		}, "\n")
 
-		state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssStub(t, table)))
+		state, err := probeRemoteSocket([]string{"host"}, path, reclaimLeftover, localProbeRunner(ssStub(t, table)))
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}
@@ -635,7 +670,7 @@ func TestRemoteSocketProbeMatchesWholeAddressFields(t *testing.T) {
 		defer l.Close()
 		table := ssHeader + "\nu_str LISTEN 0 4096 " + path
 
-		state, err := probeRemoteSocket([]string{"host"}, path, localProbeRunner(ssStub(t, table)))
+		state, err := probeRemoteSocket([]string{"host"}, path, keepLeftover, localProbeRunner(ssStub(t, table)))
 		if err != nil {
 			t.Fatalf("probeRemoteSocket() error = %v", err)
 		}

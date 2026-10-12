@@ -68,12 +68,29 @@ Common options:
                        disabled, and its lifetime is tied to the session
   --remote-socket PATH ssh only: socket path to create on the remote host
                        (default: whatever gpgconf --list-dirs agent-socket reports)
+  --skip-remote-check  ssh only: start the session even when the remote host
+                       could not be asked about that path
+  --reclaim-remote-socket
+                       ssh only: remove a socket nothing is listening on at the
+                       remote path, instead of stopping and showing you the
+                       command that removes it there
 
 The relay exposes the agent's *extra* socket, which GnuPG documents for
 exactly this remote-forwarding case. It permits signing and decryption, and
 refuses key import, export, deletion and generation, passphrase presetting,
 and trust or event queries. Passphrase prompts and any card touch confirmation
 still appear on the Windows desktop, so a PIN never crosses the SSH link.
+
+A socket that nothing is listening on at the remote path is a leftover from a
+finished session, and it blocks the next one. gpg-agent-forward does not remove it by
+default, because the check that says nothing is listening there reads the
+remote host's own socket tables - the kernel's and ss's - and those describe
+one network namespace. A listener in another namespace, such as an agent in a
+container that shares the same directory, appears in neither, so the same
+answer covers a socket that is in use. Without --reclaim-remote-socket the
+session stops and the error carries the exact command that removes the file on
+the remote host. With it, the removal goes ahead and the risk that a socket in
+another namespace was in use is yours to accept.
 `)
 }
 
@@ -153,6 +170,8 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 		"socket path to create on the remote host (default: ask the remote for `gpgconf --list-dirs agent-socket`)")
 	skipRemoteCheck := fs.Bool("skip-remote-check", false,
 		"start the session even when the remote host could not be checked for a live socket at that path")
+	reclaimRemoteSocket := fs.Bool("reclaim-remote-socket", false,
+		"remove a socket nothing is listening on at the remote path instead of stopping to tell you about it")
 	// idle选项被接受但忽略: ssh会话用的relay总是禁用idle, 因为relay无法感知
 	// 会话结束; 这里必须消费掉它, 否则会透传给ssh而被它拒绝, 会话根本起不来.
 	fs.Duration("idle", 0,
@@ -181,9 +200,14 @@ func runSSH(args []string, stdout, stderr io.Writer) error {
 	}
 
 	// 拒绝覆盖远端主机自己的agent socket: 否则首次连接会顺带启动那个agent, gpg会静默用远端密钥签名.
-	// 同一检查会清掉上次会话留下的死socket, 这是对远端的改动, 所以会报告.
-	// 探针跑不起来或判不了路径的一律拒绝; `--skip-remote-check`是明知风险的放行口, 但放不过已有结论的.
-	remoteState, err := CheckRemoteSocketFree(sshArgs, *remoteSocket, runSSHCommand)
+	// 残留socket只在用户要求 (`--reclaim-remote-socket`) 时才删并报告; 否则停下, 错误里给出删除命令.
+	// 判据是远端socket表, 只描述一个network namespace, 分不清残留和共享目录的容器里的agent.
+	// 探针跑不起来或判不了路径的也一律拒绝; `--skip-remote-check`明知风险放行, 有结论的不放行.
+	reclaim := keepLeftover
+	if *reclaimRemoteSocket {
+		reclaim = reclaimLeftover
+	}
+	remoteState, err := CheckRemoteSocketFree(sshArgs, *remoteSocket, reclaim, runSSHCommand)
 	unchecked := err != nil && *skipRemoteCheck &&
 		(remoteState == socketUnreported || remoteState == socketUnjudgeable)
 	if err != nil && !unchecked {

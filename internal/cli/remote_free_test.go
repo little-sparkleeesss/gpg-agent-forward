@@ -12,22 +12,42 @@ func runReporting(verdict string) SSHCommandRunner {
 }
 
 func TestCheckRemoteSocketFreeAcceptsAFreePath(t *testing.T) {
-	if _, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(socketAbsentMarker)); err != nil {
+	if _, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketAbsentMarker)); err != nil {
 		t.Errorf("CheckRemoteSocketFree() error = %v, want nil for a free path", err)
 	}
 }
 
 func TestCheckRemoteSocketFreeAcceptsAReclaimedPath(t *testing.T) {
 	// 无人监听的socket是结束会话的遗留而非远端agent: 在远端删除, 用户不必每次先手动清理.
-	if _, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(socketReclaimedMarker)); err != nil {
+	if _, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketReclaimedMarker)); err != nil {
 		t.Errorf("CheckRemoteSocketFree() error = %v, want nil after a dead socket is reclaimed", err)
+	}
+}
+
+func TestCheckRemoteSocketFreeRefusesALeftoverSocket(t *testing.T) {
+	// 无人绑定的socket像是结束会话的遗留, 但证据只是远端主机自己的socket表, 它们只描述一个
+	// 网络命名空间: 共享该目录的容器里的agent在两张表里都看不见, 删文件会连它的socket一起删.
+	// 会话就此停下, 报错带上决策所需: 远端删掉这个文件的命令, 和交出决定的开关.
+	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketStaleMarker))
+	if err == nil {
+		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a socket left behind")
+	}
+	if !strings.Contains(err.Error(), "--reclaim-remote-socket") {
+		t.Errorf("error %v should name --reclaim-remote-socket as the way to have it removed", err)
+	}
+	if !strings.Contains(err.Error(), "rm -f -- '/run/user/1000/gnupg/S.gpg-agent'") {
+		t.Errorf("error %v should carry the command that removes the socket on the remote host", err)
+	}
+	// 已达成的结论而非做不成的检查: 已有socket时会话本就起不来, `--skip-remote-check`在这里无事可做.
+	if strings.Contains(err.Error(), "--skip-remote-check") {
+		t.Errorf("error for a leftover socket offers --skip-remote-check: %v", err)
 	}
 }
 
 func TestCheckRemoteSocketFreeRefusesALiveSocket(t *testing.T) {
 	// 活socket属于远端自己的gpg-agent: 转发到它要靠`StreamLocalBindUnlink`顶掉占位,
 	// 会把gpg静默导向那里应答的东西, 所以报告为问题, 不能覆盖.
-	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(socketLiveMarker))
+	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketLiveMarker))
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a warning for a path in use")
 	}
@@ -41,7 +61,7 @@ func TestCheckRemoteSocketFreeRefusesALiveSocket(t *testing.T) {
 
 func TestCheckRemoteSocketFreeRefusesAFileThatIsNotASocket(t *testing.T) {
 	// 路径上的东西不是遗留agent socket, 就不是本工具该删的: 里面可能是用户的数据.
-	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(socketNotASocketMarker))
+	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketNotASocketMarker))
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a non-socket file")
 	}
@@ -51,7 +71,7 @@ func TestCheckRemoteSocketFreeRefusesAFileThatIsNotASocket(t *testing.T) {
 }
 
 func TestCheckRemoteSocketFreeRefusesAStuckSocket(t *testing.T) {
-	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(socketStuckMarker))
+	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketStuckMarker))
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when a dead socket cannot be removed")
 	}
@@ -63,7 +83,7 @@ func TestCheckRemoteSocketFreeRefusesAStuckSocket(t *testing.T) {
 func TestCheckRemoteSocketFreeRefusesWhenItCannotTell(t *testing.T) {
 	// 两张socket表不都有答案时(任一来源答不上来), 死socket与活socket无从区分,
 	// 猜"死"就可能删掉活agent的socket; 拒绝要讲清来源没答上的情形, 并给出照常启动的开关.
-	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(socketUnknownMarker))
+	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketUnknownMarker))
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the host cannot tell")
 	}
@@ -79,10 +99,11 @@ func TestCheckRemoteSocketFreeRefusesWhenItCannotTell(t *testing.T) {
 }
 
 func TestCheckRemoteSocketFreeOffersNoSkipForAVerdictItReached(t *testing.T) {
-	// `--skip-remote-check`只对做不成的检查有效, 对已达成的结论无效: 活socket, 非socket文件,
-	// 符号链接, 删不掉的socket都是确定答案, 它们的报错不得提供这个覆盖开关.
-	for _, marker := range []string{socketLiveMarker, socketNotASocketMarker, socketStuckMarker, socketSymlinkMarker} {
-		_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(marker))
+	// `--skip-remote-check`只对做不成的检查有效, 对已达成的结论无效:
+	// 活socket, 非socket文件, 符号链接, 遗留, 删不掉的socket都是确定答案, 不是信息缺失而是
+	// 停下的理由, 报错不得提供该开关; 遗留是本端唯一可处理的结论, 其报错改带删除命令和开关.
+	for _, marker := range []string{socketLiveMarker, socketNotASocketMarker, socketStuckMarker, socketSymlinkMarker, socketStaleMarker} {
+		_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(marker))
 		if err == nil {
 			t.Errorf("CheckRemoteSocketFree(%s) error = nil, want a refusal", marker)
 			continue
@@ -97,7 +118,7 @@ func TestCheckRemoteSocketFreeRefusesWhenNoVerdictIsReported(t *testing.T) {
 	// 毫无标记说明探针没按原样跑(如登录shell解析不了): 没删东西, 也没检查, 而这样启动正是
 	// sshd绑上活agent socket的途径. 拒绝要给出绕行开关, 让这个风险是用户明知的选择.
 	run := func([]string, string) (string, error) { return "Welcome to the host\n", nil }
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", run)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", keepLeftover, run)
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when nothing was reported")
 	}
@@ -115,7 +136,7 @@ func TestCheckRemoteSocketFreeIgnoresBannerMentioningAMarkerWord(t *testing.T) {
 	run := func([]string, string) (string, error) {
 		return "WARNING: your token is absent, present it soon\n" + socketLiveMarker + "\n", nil
 	}
-	if _, err := CheckRemoteSocketFree([]string{"host"}, "/p", run); err == nil {
+	if _, err := CheckRemoteSocketFree([]string{"host"}, "/p", keepLeftover, run); err == nil {
 		t.Error("CheckRemoteSocketFree() error = nil, want the live verdict taken from the marker, not from the banner")
 	}
 }
@@ -123,7 +144,7 @@ func TestCheckRemoteSocketFreeIgnoresBannerMentioningAMarkerWord(t *testing.T) {
 func TestCheckRemoteSocketFreeRefusesASymlink(t *testing.T) {
 	// 符号链接既不删除也不判为空闲: 它背后是什么在这端看不出, 归咎于缺少`ss`会让用户
 	// 找错方向.
-	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runReporting(socketSymlinkMarker))
+	_, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runReporting(socketSymlinkMarker))
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal for a symbolic link")
 	}
@@ -147,7 +168,7 @@ func TestRemoteSocketProbeEscapesAQuoteInThePath(t *testing.T) {
 		seen = cmd
 		return socketAbsentMarker + "\n", nil
 	}
-	CheckRemoteSocketFree([]string{"host"}, quotePath, run)
+	CheckRemoteSocketFree([]string{"host"}, quotePath, keepLeftover, run)
 
 	if !strings.HasPrefix(seen, "sh -c ") {
 		t.Fatalf("remote command %q should run under sh", seen)
@@ -171,7 +192,7 @@ func shellUnquoteSingle(s string) string {
 
 func TestCheckRemoteSocketFreeSurfacesRunnerFailure(t *testing.T) {
 	run := func([]string, string) (string, error) { return "", errors.New("ssh: connection failed") }
-	if _, err := CheckRemoteSocketFree([]string{"host"}, "/p", run); err == nil {
+	if _, err := CheckRemoteSocketFree([]string{"host"}, "/p", keepLeftover, run); err == nil {
 		t.Error("CheckRemoteSocketFree() error = nil, want the ssh failure surfaced")
 	}
 }

@@ -53,8 +53,10 @@ var sshOwnFlags = map[string]bool{
 
 // 开关选项单列: `sshOwnFlags`会把后一个参数当值消费, 混进去会吞掉目标主机.
 var sshOwnBoolFlags = map[string]bool{
-	"-skip-remote-check":  true,
-	"--skip-remote-check": true,
+	"-skip-remote-check":      true,
+	"--skip-remote-check":     true,
+	"-reclaim-remote-socket":  true,
+	"--reclaim-remote-socket": true,
 }
 
 // ssh自带`-N`, `-p`, `-i`, `-o`, 交给通用flag解析器会被拒; 这里只消费自己认识的选项,

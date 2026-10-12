@@ -235,6 +235,7 @@ const (
 	socketReclaimedMarker  = "gpg-agent-forward-socket-reclaimed"
 	socketLiveMarker       = "gpg-agent-forward-socket-live"
 	socketNotASocketMarker = "gpg-agent-forward-socket-notasocket"
+	socketStaleMarker      = "gpg-agent-forward-socket-stale"
 	socketStuckMarker      = "gpg-agent-forward-socket-stuck"
 	socketUnknownMarker    = "gpg-agent-forward-socket-unknown"
 	socketSymlinkMarker    = "gpg-agent-forward-socket-symlink"
@@ -245,6 +246,7 @@ type remoteSocketState int
 const (
 	socketFree        remoteSocketState = iota // 路径上什么都没有
 	socketReclaimed                            // 死socket已被删除
+	socketStale                                // 死socket还在, 没有动它
 	socketLive                                 // 有东西在监听
 	socketNotASocket                           // 挡路的是非socket文件
 	socketStuck                                // 死socket还在, 删不掉
@@ -253,17 +255,35 @@ const (
 	socketSymlink                              // 路径是符号链接
 )
 
+// reclaimPolicy: 调用方允许探针对没东西绑定的socket做什么.
+// 用具名类型而不是bool: 两个策略差在是否删除远端文件, keepLeftover是零值, 忘了选也安全.
+type reclaimPolicy bool
+
+const (
+	// keepLeftover: 只报告, 不动文件, 也是默认值. 已死的证据只覆盖本网络命名空间,
+	// 别的命名空间里的监听者两个来源都不出现 (详见 `remoteSocketProbe`).
+	keepLeftover reclaimPolicy = false
+	// reclaimLeftover: 删除它, 调用方以此接受来源排除不了别的命名空间里的监听者.
+	reclaimLeftover reclaimPolicy = true
+)
+
 // procNetUnixPath: 探针读的第二份独立证据, 内核的unix socket表.
 // 写成常量是为了让测试能替换这个名字: 绝对路径`/proc/net/unix`没法被unmount或改成不可读.
 const procNetUnixPath = "/proc/net/unix"
 
-// remoteSocketProbe: 一条远端命令报告path处是什么, 判定为死socket时就地删除.
-// 判定与删除同行: 只有主机能分辨死socket与活socket; 检查与rm之间的竞态无锁可拿, 明知而接受.
-// 命令必须是一行: sshd先把整串交给远端用户的登录shell, csh/tcsh拒绝跨行的引号词 (Unmatched '),
-// 于是什么都不跑; sh -c只为if/elif给出已知解释器, 不解析外层; 删除只做能正面排除的情况:
-// 活socket永不删; ss是程序, 可能过滤行或被沙箱掐掉回答却仍打印表头, 单凭它说"没有"不算数;
-// 要`ss -xl`和`/proc/net/unix`两个独立来源都说已死才删; 读不到的不算数; 内核表按路径而非inode匹配.
-func remoteSocketProbe(path string) string {
+// 判定与删除同在一条远端命令:只有远端分得清死活,分两次只会拉大关不掉的窗口(检查与`rm`仍隔进程).
+// 命令必须单行:sshd把整串交给登录shell,`csh`/`tcsh`遇跨行引号词整条不跑.只做能正面排除的删除:
+// 活socket永不删,两路来源都可读且都没提才可删:`ss`(会过滤行,或就是错的)与内核的`/proc/net/unix`;
+// 内核表列所有已bind的socket,`ss -xl`只列listener,矛盾时以内核为准;任一名列路径即为活;
+// 路径按整字段而非子串匹配,绝不按inode:内核的inode列是socket的sockfs inode,与路径文件的inode不同;
+// 符号链接只报不可判定:内核记的是监听者绑的路径,未必是链接自身的名字;读不到的来源不算"没提".
+func remoteSocketProbe(path string, reclaim reclaimPolicy) string {
+	// 两个来源都否认时:删除是对远端的改动,仅在调用方要求时做,默认只报状态
+	leftoverArm := "else echo " + socketStaleMarker + "; fi;"
+	if reclaim == reclaimLeftover {
+		leftoverArm = "elif rm -f -- \"$p\"; then echo " + socketReclaimedMarker + "; else echo " + socketStuckMarker + "; fi;"
+	}
+
 	// 分片拼接只为可读;这条远程命令必须保持单行
 	script := strings.Join([]string{
 		"p=" + shellQuoteSingle(path) + ";",
@@ -290,8 +310,8 @@ func remoteSocketProbe(path string) string {
 		"live=no; case \" $flat \" in *\" $p \"*) live=yes;; esac;",
 		"if [ \"$live\" = yes ]; then echo " + socketLiveMarker + ";",
 		"elif [ \"$has_table\" = no ] || [ \"$proc_table\" = no ]; then echo " + socketUnknownMarker + ";",
-		"elif rm -f -- \"$p\"; then echo " + socketReclaimedMarker + ";",
-		"else echo " + socketStuckMarker + "; fi; fi;",
+		leftoverArm,
+		"fi;",
 		"else echo " + socketUnknownMarker + "; fi;",
 		"else echo " + socketNotASocketMarker + "; fi;",
 		"else echo " + socketAbsentMarker + "; fi",
@@ -299,11 +319,12 @@ func remoteSocketProbe(path string) string {
 	return "sh -c " + shellQuoteSingle(script)
 }
 
-// 无人绑定的socket是结束会话的遗留,删;活socket(远端agent或他人同路径)与非socket文件不碰.
-// 判明需要两路证据,缺一路,失败或答的不是表都算没答;一路为何不够详见`remoteSocketProbe`.
-// 状态仅在error为nil时有意义:判不出来一律返回`socketUnjudgeable`,忽略错误者即拒绝.
-func probeRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRunner) (remoteSocketState, error) {
-	out, err := run(sshArgs, remoteSocketProbe(remoteSocket))
+// 询问远端path处有什么并按reclaim的限度行动.
+// 活socket(远端agent或他人同路径)与非socket文件不碰;判明需两路证据,
+// 缺一路,失败或答的不是表都算没答.一路为何不够,遗留为何默认只报不删,详见`remoteSocketProbe`.
+// 状态仅在error为nil时有意义:判不出来返回`socketUnjudgeable`.
+func probeRemoteSocket(sshArgs []string, remoteSocket string, reclaim reclaimPolicy, run SSHCommandRunner) (remoteSocketState, error) {
+	out, err := run(sshArgs, remoteSocketProbe(remoteSocket, reclaim))
 	if err != nil {
 		// 原样返回:调用方各自会加上自己的语境,在此包装会文不对题
 		return socketUnjudgeable, err
@@ -314,6 +335,8 @@ func probeRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRunn
 			return socketFree, nil
 		case socketReclaimedMarker:
 			return socketReclaimed, nil
+		case socketStaleMarker:
+			return socketStale, nil
 		case socketLiveMarker:
 			return socketLive, nil
 		case socketNotASocketMarker:
@@ -332,11 +355,13 @@ func probeRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRunn
 }
 
 // 让sshd即将绑定的远端路径可用,不可用则说明原因.
-// 活socket属于远端gpg-agent:转发时sshd的`StreamLocalBindUnlink`会顶掉它占位,
-// gpg便静默连上别的agent,故拒绝覆盖;无人监听的遗留则删除放行,路径不存在是健康的.
-// 仅error为nil才放行;判不出来的状态一律拒绝,错误里带`--skip-remote-check`;有明确判定则不给.
-func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommandRunner) (remoteSocketState, error) {
-	state, err := probeRemoteSocket(sshArgs, remoteSocket, run)
+// 活socket属于远端自己的gpg-agent:转发时sshd的`StreamLocalBindUnlink`会顶掉它占位,
+// gpg便静默连上别的agent,故拒绝覆盖.
+// 无人监听的遗留由调用方(reclaim)决定:证据只管一个网络命名空间,默认`keepLeftover`停下引导,
+// 用户可手动删除或开`--reclaim-remote-socket`;`reclaimLeftover`则删除后放行.
+// 仅error为nil才放行;判不出来者拒绝并带`--skip-remote-check`,明确判定(如`socketStale`)只带删除指引.
+func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, reclaim reclaimPolicy, run SSHCommandRunner) (remoteSocketState, error) {
+	state, err := probeRemoteSocket(sshArgs, remoteSocket, reclaim, run)
 	if err != nil {
 		return state, fmt.Errorf("checking what is at %s on the remote host: %w", remoteSocket, err)
 	}
@@ -350,6 +375,16 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommand
 				"  Starting without the check would let sshd bind over a live gpg-agent socket, and gpg would then follow the wrong agent.\n"+
 				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
 			remoteSocket)
+	case socketStale:
+		return state, fmt.Errorf(
+			"a socket nothing is listening on is left at %s on the remote host, and it is not removed unless you ask for that.\n"+
+				"  The evidence that it is dead comes from that host's own socket tables, and those describe one network\n"+
+				"  namespace: an agent in a container that shares the directory is absent from both of them, so removing\n"+
+				"  the file would take a socket that is in use away from it.\n"+
+				"  Remove it there if nothing else is using it:\n"+
+				"      rm -f -- %s\n"+
+				"  or pass --reclaim-remote-socket to have gpg-agent-forward remove it and start the session.",
+			remoteSocket, shellQuoteSingle(remoteSocket))
 	case socketLive:
 		return state, fmt.Errorf(
 			"%s already exists on the remote host, so it is in use by that host's own gpg-agent.\n"+

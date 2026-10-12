@@ -675,7 +675,7 @@ func TestCheckRemoteSocketFreeAcceptsAHostThatAnsweredBeforeThePipeWasHeld(t *te
 	requireStandInSSH(t)
 	t.Setenv("PATH", standInSSHPath(t, "echo "+socketAbsentMarker+"\n"+pipeHolder+"exit 0\n"))
 
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runSSHCommand)
 	if err != nil {
 		t.Fatalf("CheckRemoteSocketFree() error = %v, want nil: the probe answered", err)
 	}
@@ -705,7 +705,7 @@ func TestCheckRemoteSocketFreeStillRefusesWhenNothingWasReported(t *testing.T) {
 	requireStandInSSH(t)
 	t.Setenv("PATH", standInSSHPath(t, pipeHolder+"exit 0\n"))
 
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", keepLeftover, runSSHCommand)
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the probe reported nothing")
 	}
@@ -783,7 +783,7 @@ func TestRunSSHQueryTruncationNeverReportsAFreePath(t *testing.T) {
 	requireStandInSSH(t)
 	t.Setenv("PATH", standInSSHPath(t, "echo "+socketLiveMarker+"\n"+noisyAnswer+"\n"))
 
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", keepLeftover, runSSHCommand)
 	if err == nil {
 		t.Fatal("CheckRemoteSocketFree() error = nil, want a refusal when the verdict was dropped")
 	}
@@ -799,7 +799,7 @@ func TestCheckRemoteSocketFreeGivesUpOnAHostThatNeverAnswers(t *testing.T) {
 	t.Setenv("PATH", standInSSHPath(t, "sleep 30\n"))
 
 	start := time.Now()
-	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", runSSHCommand)
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/p", keepLeftover, runSSHCommand)
 	elapsed := time.Since(start)
 
 	if err == nil {
