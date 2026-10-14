@@ -1,0 +1,103 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布 tag, 形如 v0.1.0; 留空则更新 nightly 预发布'
+        required: false
+        type: string
+      prerelease:
+        description: '标记为预发布; 只在填了 tag 时有意义, nightly 恒为预发布'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v[0-9]*'
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build windows/${{ matrix.goarch }}
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          exe="dist/gpg-agent-forward-${GOOS}-${GOARCH}.exe"
+          go build -trimpath -ldflags '-s -w' -o "$exe" ./cmd/gpg-agent-forward
+          # 文件名里的架构只是这一步手写的; 构建信息由构建器自己写入, 用它核对产物真身.
+          info=$(go version -m "$exe")
+          grep -q "GOOS=${GOOS}" <<<"$info" || { echo "::error::$exe is not a ${GOOS} build"; exit 1; }
+          grep -q "GOARCH=${GOARCH}" <<<"$info" || { echo "::error::$exe is not a ${GOARCH} build"; exit 1; }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gpg-agent-forward-windows-${{ matrix.goarch }}
+          path: dist/gpg-agent-forward-windows-${{ matrix.goarch }}.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum ./*.exe > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ -z "$INPUT_TAG" ]; then
+            # 手动留空 = nightly: 名字固定免得起名, 产物每次替换, tag 跟着挪到当次 commit.
+            # 产物里带着构建时的 commit (`go version -m` 可查), 且以预发布发布, 不占用 Latest.
+            notes="nightly 滚动构建: 产物随每次手动运行替换, tag 指向当次 commit $GITHUB_SHA; 这不是版本发布."
+            if gh release view nightly >/dev/null 2>&1; then
+              # 挪 tag 再替换产物, 而不是删掉重建: 中途失败也不会留下一段没有 release 的空窗.
+              gh api --method PATCH "repos/$GH_REPO/git/refs/tags/nightly" \
+                -f sha="$GITHUB_SHA" -F force=true >/dev/null
+              gh release upload nightly dist/* --clobber
+              gh release edit nightly --notes "$notes"
+            else
+              gh release create nightly --target "$GITHUB_SHA" --prerelease --notes "$notes" dist/*
+            fi
+            exit 0
+          fi
+          # 手动输入的 tag 会进 git ref 和 gh 参数, 只放行字母数字加 . _ + - 的安全集;
+          # 必须以 v 加数字开头, 与 push 触发的那条路径同形, 否则两条入口会产出两套命名.
+          # 用 bash 的整串匹配而非 grep: grep 逐行判, 带换行的输入会被它的第一行蒙混过关.
+          tag="${INPUT_TAG:-$TAG}"
+          if [[ ! "$tag" =~ ^v[0-9][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::tag '$tag' must start with v and a digit, then only letters, digits, dot, dash, underscore or plus"
+            exit 1
+          fi
+          args=(--generate-notes --target "$GITHUB_SHA")
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          # tag 已存在而 release 不存在时会沿用它; release 已存在则 gh 报错退出, 不覆盖已发布的版本.
+          gh release create "$tag" "${args[@]}" dist/*
