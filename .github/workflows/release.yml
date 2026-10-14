@@ -57,6 +57,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 本作业只读仓库里的第三方声明, 不推任何东西: 不留凭据, 免得写入权限的令牌躺在 .git/config 里.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -64,6 +68,10 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum ./*.exe > SHA256SUMS
+      - name: Third-party notices
+        # 二进制里静态链接了 golang.org/x/sys (BSD-3-Clause), 再分发要一并给出它的版权声明与许可条款.
+        # 只校验二进制, 声明不进 SHA256SUMS: 列进去会让只下了 exe 的人 `sha256sum -c` 因缺文件而失败.
+        run: cp THIRD_PARTY_NOTICES.txt dist/
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
