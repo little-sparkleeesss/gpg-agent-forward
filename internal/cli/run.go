@@ -82,20 +82,27 @@ finished session, and it blocks the next one. gpg-agent-forward removes it befor
 session starts, so a finished session does not have to be cleaned up by hand.
 
 What it asks before removing anything is the remote host itself, not its socket
-tables. The check creates a socket next to the path and has the host connect to
-it, twice: once on a socket the check owns, to prove that this host on this
-connection permits such a connection at all, and once on the path itself. A
-connection that stays open and silent is a live listener, and the session
-stops: the path belongs to that host's own agent, and forwarding onto it would
-make gpg follow the wrong agent. A connection that closes without an answer,
-with that control in hand, is a leftover, and it is removed. The path is never
-removed when it cannot be written, when it is not a socket, or when the host
-cannot be asked or cannot answer - those all stop the session, and each error
-carries the way to deal with it. --skip-remote-check is how a session starts
-anyway when the host could not be asked or could not answer; it is no answer to
-a path your user there cannot write, where a refused connect and a socket
-nothing is listening on read the same, and the point is to stop rather than
-guess. Do not clear such a path by hand: something may be listening on it.
+tables, and it asks in the host's own user context first: a short script runs
+there with python3, python or perl, whichever the host has, and connects to the
+path. A connection that is refused is a leftover, and it is removed; a path that
+is already gone is free; a connection the host accepts, whether it then stays
+silent, greets, or closes, is a listener, and the session stops: the path
+belongs to that host's own agent, and forwarding onto it would make gpg follow
+the wrong agent. Asking as the user is deliberate - that is how gpg on that host
+reaches the path, so its answer is the one that matters, and it keeps working
+where the host's sshd may not connect to a socket it bound itself (Fedora's
+SELinux policy forbids sshd_session_t from connecting to sshd_session_t
+sockets). Only a host with no interpreter falls back to having its sshd connect
+to the path, with a control connection of the check's own to tell a refusal
+apart from a socket nothing is listening on.
+
+The path is never removed when it cannot be written, when it is not a socket, or
+when the host cannot be asked or cannot answer - those all stop the session, and
+each error carries the way to deal with it. --skip-remote-check is how a session
+starts anyway when the check could not be made; it is no answer to a path your
+user there cannot write, where a refused connect and a socket nothing is
+listening on read the same, and the point is to stop rather than guess. Do not
+clear such a path by hand: something may be listening on it.
 `)
 }
 

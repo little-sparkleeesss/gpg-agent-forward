@@ -134,6 +134,275 @@ func shortTempDir(t *testing.T) string {
 	return dir
 }
 
+// 分类命令与形态命令受同一套约束: 单行, 且路径的字节不上命令行; 单行由这两条钉住.
+func TestRemoteSocketConnectCommandIsOneLineUnderSh(t *testing.T) {
+	// 与形态命令同理: 远端登录shell可能是csh/tcsh, 跨行的引号串它直接拒绝, 之后就什么都不跑.
+	cmd := remoteSocketConnect("/run/user/1000/gnupg/S.gpg-agent")
+	if strings.ContainsAny(cmd, "\n\r") {
+		t.Errorf("command %q spans lines, which the remote login shell refuses to parse", cmd)
+	}
+	if !strings.HasPrefix(cmd, "sh -c ") {
+		t.Errorf("command %q does not run its body under sh", cmd)
+	}
+}
+
+// 替身解释器: sh脚本, 把收到的路径 (python/perl的体都从argv取路径, 在-c/-e后面, 故是$3)
+// 写进evidence, 再打印word; word为空就是"什么都没答", 级联应当继续找下一个.
+func fakeInterpreter(t *testing.T, dir, name, word, evidence string) {
+	t.Helper()
+	body := "#!/bin/sh\n"
+	if evidence != "" {
+		body += "printf '%s\\n' \"$3\" > " + shellQuoteSingle(evidence) + "\n"
+	}
+	if word != "" {
+		body += "printf '%s\\n' " + shellQuoteSingle(word) + "\n"
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+		t.Fatalf("write the %s stand-in: %v", name, err)
+	}
+}
+
+// 一个只有sh的PATH加若干替身解释器; sh要在场, 分类命令的外层靠它跑.
+func fakeInterpreterDir(t *testing.T) string {
+	t.Helper()
+	requireShell(t)
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("sh is not on PATH: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.Symlink(sh, filepath.Join(dir, "sh")); err != nil {
+		t.Fatalf("link sh into the stand-in PATH: %v", err)
+	}
+	return dir
+}
+
+// connectCommandOutput跑分类命令, 原样返回它的输出: 断言既能看判定, 也能看标记行本身.
+func connectCommandOutput(t *testing.T, path, pathEnv string) string {
+	t.Helper()
+	out, err := localProbeRunner(pathEnv)([]string{"host"}, remoteSocketConnect(path))
+	if err != nil {
+		t.Fatalf("running the classify command for %s failed: %v (output %q)", path, err, out)
+	}
+	return out
+}
+
+func TestRemoteSocketConnectUsesTheInterpretersItFindsInOrder(t *testing.T) {
+	// 顺序取第一个能答话的: python3在python前, python在perl前; 被问到的替身留下证据.
+	dir := fakeInterpreterDir(t)
+	silent, spoken := filepath.Join(dir, "silent.evidence"), filepath.Join(dir, "spoken.evidence")
+	fakeInterpreter(t, dir, "python3", "", silent)
+	fakeInterpreter(t, dir, "python", "refused", spoken)
+
+	out := connectCommandOutput(t, "/run/user/1000/gnupg/S.gpg-agent", dir)
+	verdict, _ := parseSocketConnectVerdict(out)
+	if verdict != connectRefused {
+		t.Errorf("verdict = %v from output %q, want connectRefused from the second interpreter", verdict, out)
+	}
+	if _, err := os.Stat(silent); err != nil {
+		t.Errorf("the first interpreter was not asked: %v", err)
+	}
+	if _, err := os.Stat(spoken); err != nil {
+		t.Errorf("the cascade did not reach the second interpreter: %v", err)
+	}
+}
+
+func TestRemoteSocketConnectReportsNoneWhenNoInterpreterIsThere(t *testing.T) {
+	// 一台只有shell的主机: 分类没有连接器可用, 标记none让调用方退回sshd转发那条路.
+	bare := pathWithOnlySh(t)
+	out := connectCommandOutput(t, "/run/user/1000/gnupg/S.gpg-agent", bare)
+	if !strings.Contains(out, socketConnectNoneMarker) {
+		t.Errorf("output %q should carry %s on a host with no interpreter", out, socketConnectNoneMarker)
+	}
+	if verdict, _ := parseSocketConnectVerdict(out); verdict != connectNoVerdict {
+		t.Errorf("verdict = %v, want connectNoVerdict when nothing reported", verdict)
+	}
+}
+
+func TestRemoteSocketConnectKeepsItsVerdictToTheWordsItKnows(t *testing.T) {
+	// 解释器打了别的东西 (坏了, 或者主机换了一个同名程序): 不是判定, 调用方照旧fail-closed.
+	dir := fakeInterpreterDir(t)
+	fakeInterpreter(t, dir, "python3", "banana", "")
+	out := connectCommandOutput(t, "/run/user/1000/gnupg/S.gpg-agent", dir)
+	if verdict, _ := parseSocketConnectVerdict(out); verdict != connectNoVerdict {
+		t.Errorf("verdict = %v from output %q, want connectNoVerdict for a word this tool does not know", verdict, out)
+	}
+}
+
+func TestRemoteSocketConnectNeverPutsThePathOnTheCommandLine(t *testing.T) {
+	// 与形态命令同理: csh/tcsh连单引号里也做历史展开与变量替换, 路径的字节只能走八进制.
+	requireShell(t)
+	canary := filepath.Join(t.TempDir(), "canary")
+	paths := []string{
+		"/run/user/1000/gnupg!bang/S.gpg-agent",
+		"/run/user/1000/gnupg%h/S.gpg-agent",
+		"/run/user/1000/it's/S.gpg-agent",
+		"/run/user/1000/with space/S.gpg-agent",
+		"/run/user/1000/`id`/$HOME/S.gpg-agent",
+		"/run/user/1000/back\\slash/S.gpg-agent",
+		"/run/user/1000/gnupg-\xe4\xbb\xa3\xe7\x90\x86/S.gpg-agent",
+		"/run/user/1000/x';touch " + canary + ";'/S.gpg-agent",
+	}
+	command := remoteSocketConnect(paths[0])
+	for _, path := range paths {
+		if strings.Contains(strings.ReplaceAll(command, paths[0], ""), path) {
+			t.Errorf("command carries %q verbatim:\n%s", path, command)
+		}
+	}
+	// 解码往返: 替身把收到的路径写出来, 应与给的字节逐个相同.
+	dir := fakeInterpreterDir(t)
+	evidence := filepath.Join(t.TempDir(), "evidence")
+	fakeInterpreter(t, dir, "python3", "refused", evidence)
+	for _, path := range paths {
+		out := connectCommandOutput(t, path, dir)
+		if verdict, _ := parseSocketConnectVerdict(out); verdict != connectRefused {
+			t.Fatalf("verdict = %v from output %q for %q", verdict, out, path)
+		}
+		got, err := os.ReadFile(evidence)
+		if err != nil {
+			t.Fatalf("the stand-in interpreter recorded nothing for %q: %v", path, err)
+		}
+		if strings.TrimRight(string(got), "\n") != path {
+			t.Errorf("the interpreter was handed %q, want %q", strings.TrimRight(string(got), "\n"), path)
+		}
+	}
+	if _, err := os.Stat(canary); err == nil {
+		t.Errorf("%s exists: a byte of the path was run as a command", canary)
+	}
+}
+
+func TestRemoteSocketConnectCommandRunsUnderTcsh(t *testing.T) {
+	// FreeBSD root登录时sshd用的shell; `-f`跳过cshrc, 只量命令不量登录环境.
+	tcsh, err := exec.LookPath("tcsh")
+	if err != nil {
+		t.Skip("tcsh is not installed; TestRemoteSocketConnectCommandIsOneLineUnderSh covers the shape it rejects")
+	}
+	dir := shortTempDir(t)
+	dead := filepath.Join(dir, "dead.sock")
+	deadSocketAt(t, dead)
+	paths := map[string]string{
+		"an ordinary path": dead,
+		"a path with the characters csh and tcsh read twice": filepath.Join(dir, "gpg!agent%h$HOME`id`"),
+	}
+	for name, path := range paths {
+		t.Run(name, func(t *testing.T) {
+			out, err := exec.Command(tcsh, "-f", "-c", remoteSocketConnect(path)).Output()
+			if err != nil {
+				t.Fatalf("tcsh could not run the command: %v (output %q)", err, out)
+			}
+			want := connectAbsent
+			if path == dead {
+				want = connectRefused
+			}
+			if got, _ := parseSocketConnectVerdict(string(out)); got != want {
+				t.Errorf("verdict = %v from output %q, want %v", got, out, want)
+			}
+		})
+	}
+}
+
+// 连接器归用户域: 远端gpg就是那么连过去的. 每种结果一个用例, 判定必须是它自己给的errno,
+// 没有可猜的余地 (这也正是它不需要sshd那条路的正向控制的原因).
+func TestRemoteSocketConnectReportsWhatIsAtThePath(t *testing.T) {
+	requireShell(t)
+	if _, err := anySocketInterpreter(); err != nil {
+		t.Skipf("no python3, python or perl to run the classifier with: %v", err)
+	}
+	dir := shortTempDir(t)
+	dead := filepath.Join(dir, "dead.sock")
+	deadSocketAt(t, dead)
+	live := filepath.Join(dir, "live.sock")
+	l := liveSocketAt(t, live)
+	defer l.Close()
+	greeter := filepath.Join(dir, "greeter.sock")
+	g := greeterSocketAt(t, greeter)
+	defer g.Close()
+	closer := filepath.Join(dir, "closer.sock")
+	c := closingSocketAt(t, closer)
+	defer c.Close()
+	// 连接都不是"没人监听"也不是"有监听者"的错误: 判不了, 调用方照旧拒绝.
+	loop := filepath.Join(dir, "loop.sock")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatalf("make a symlink loop at %s: %v", loop, err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+		want socketConnectVerdict
+	}{
+		{"a socket nothing listens on", dead, connectRefused},
+		{"a live socket", live, connectHeld},
+		{"a socket that greets first", greeter, connectSpoke},
+		{"a socket that closes without a word", closer, connectClosed},
+		{"a path that is not there", filepath.Join(dir, "nope.sock"), connectAbsent},
+		{"a path that cannot be resolved", loop, connectOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, errno := parseSocketConnectVerdict(connectCommandOutput(t, tc.path, os.Getenv("PATH")))
+			if got != tc.want {
+				t.Errorf("verdict = %v, want %v for %s", got, tc.want, tc.name)
+			}
+			if tc.want == connectOther && errno == 0 {
+				t.Errorf("the other-word should carry that host's errno, got 0")
+			}
+		})
+	}
+}
+
+// greeterSocketAt: 连上就说一句话的socket: 判据里"答了话"的那一支.
+func greeterSocketAt(t *testing.T, path string) net.Listener {
+	t.Helper()
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", path, err)
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte("OK\n"))
+				time.Sleep(time.Hour)
+			}(c)
+		}
+	}()
+	return l
+}
+
+// closingSocketAt: 接受后立刻结束连接的socket: 判据里"没答话就结束"的那一支.
+func closingSocketAt(t *testing.T, path string) net.Listener {
+	t.Helper()
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", path, err)
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	return l
+}
+
+// anySocketInterpreter: 分类命令在真主机上要用的解释器, 一个都没有时用例跳过.
+func anySocketInterpreter() (string, error) {
+	for _, name := range []string{"python3", "python", "perl"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p, nil
+		}
+	}
+	return "", errors.New("none of python3, python, perl is on PATH")
+}
+
 func TestRemoteSocketFormCommandIsOneLineUnderSh(t *testing.T) {
 	// sshd先把命令交给远端登录shell: `csh`/`tcsh`对跨行的引号串报"Unmatched '",
 	// 之后什么都不跑, 所以多行命令永远报不出结论.

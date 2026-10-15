@@ -575,6 +575,56 @@ func TestParseRemoteSocketOutput(t *testing.T) {
 	}
 }
 
+func TestParseSocketConnectVerdict(t *testing.T) {
+	// 结果词是解释器打的, 认不出来的东西都不是判定: 判成"没人监听"就会删掉在用的socket.
+	tests := []struct {
+		name      string
+		out       string
+		want      socketConnectVerdict
+		wantErrno int
+	}{
+		{"refused", socketConnectPrefix + socketConnectRefusedWord + "\n", connectRefused, 0},
+		{"absent", socketConnectPrefix + socketConnectAbsentWord + "\n", connectAbsent, 0},
+		{"held", socketConnectPrefix + socketConnectHeldWord + "\n", connectHeld, 0},
+		{"spoke", socketConnectPrefix + socketConnectSpokeWord + "\n", connectSpoke, 0},
+		{"closed", socketConnectPrefix + socketConnectClosedWord + "\n", connectClosed, 0},
+		{"other carries the errno", socketConnectPrefix + socketConnectOtherWord + "-13\n", connectOther, 13},
+		{"none is not a verdict", socketConnectNoneMarker + "\n", connectNoVerdict, 0},
+		{"banners and unknown words", "Welcome to the host\n" + socketConnectPrefix + "banana\n", connectNoVerdict, 0},
+		{"an other-word without a number", socketConnectPrefix + socketConnectOtherWord + "-\n", connectNoVerdict, 0},
+		{"the marker with trailing text", socketConnectPrefix + socketConnectRefusedWord + "x\n", connectNoVerdict, 0},
+		{"nothing at all", "", connectNoVerdict, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, errno := parseSocketConnectVerdict(tt.out)
+			if got != tt.want || errno != tt.wantErrno {
+				t.Errorf("parseSocketConnectVerdict(%q) = %v, %d; want %v, %d", tt.out, got, errno, tt.want, tt.wantErrno)
+			}
+		})
+	}
+}
+
+// 解释器体与被测标记名要一直对得上: 结果词在两边各写一份 (Go里一份, 解释器里一份), 漂了就是判不出.
+// 少一个词不是少一种判定, 是那一类结果从此读不出来.
+func TestSocketConnectWordsMatchTheInterpreterBodies(t *testing.T) {
+	words := []string{
+		socketConnectRefusedWord,
+		socketConnectAbsentWord,
+		socketConnectHeldWord,
+		socketConnectSpokeWord,
+		socketConnectClosedWord,
+		socketConnectOtherWord,
+	}
+	for name, body := range map[string]string{"python": pythonSocketConnect, "perl": perlSocketConnect} {
+		for _, word := range words {
+			if !strings.Contains(body, word) {
+				t.Errorf("the %s body does not mention the word %q:\n%s", name, word, body)
+			}
+		}
+	}
+}
+
 func TestDiscoverRemoteSocketUsesTheRemoteAnswer(t *testing.T) {
 	var gotArgs []string
 	runner := func(args []string) (string, error) {

@@ -268,6 +268,29 @@ const (
 	// socketReclaimedMarker和socketStuckMarker: 删除的两种结果, 文件已删掉或还在.
 	socketReclaimedMarker = "gpg-agent-forward-socket-reclaimed"
 	socketStuckMarker     = "gpg-agent-forward-socket-stuck"
+	// socketConnectNoneMarker: 远端没有可用的解释器, 分类退回sshd转发那条路.
+	socketConnectNoneMarker = socketConnectPrefix + socketConnectNoneWord
+)
+
+// 分类命令的结果词与标记: 解释器只打印结果词, 前缀由shell脚本统一加,
+// 于是标记名只在这里拼一次, 解析与生成不会各写一份.
+const (
+	// socketConnectPrefix: 连接判定的标记前缀, 后接解释器打印的结果词.
+	socketConnectPrefix = "gpg-agent-forward-connect-"
+	// socketConnectNoneWord: 没找到解释器.
+	socketConnectNoneWord = "none"
+	// socketConnectRefusedWord: 连接被拒 (ECONNREFUSED), 没人监听.
+	socketConnectRefusedWord = "refused"
+	// socketConnectAbsentWord: 路径已经不在了 (ENOENT), 形态检查与这里之间的窗口.
+	socketConnectAbsentWord = "absent"
+	// socketConnectHeldWord: 连上之后一直不答话; 不说话的监听者就是这样, gpg-agent即是.
+	socketConnectHeldWord = "held"
+	// socketConnectSpokeWord: 连上且答了话, 对面有东西可对话.
+	socketConnectSpokeWord = "spoke"
+	// socketConnectClosedWord: 连上后没答话就结束, 同sshd那条路的判决.
+	socketConnectClosedWord = "closed"
+	// socketConnectOtherWord: 以别的错误结束, 后接errno; 判不了.
+	socketConnectOtherWord = "other"
 )
 
 // remoteSocketForm: 一条远端命令, 只用shell自己的测试报告path上是什么.
@@ -301,6 +324,52 @@ func remoteSocketRemove(path string) string {
 	}, " ")
 	return "sh -c " + shellQuoteSingle(script)
 }
+
+// remoteSocketConnect: 一条远端命令, 让远端用户域里的解释器去连path, 按结果打印标记行.
+// 连接者是用户域而不是sshd: 远端gpg本来就是用户域连过去的, 而sshd域在SELinux这类加固下
+// 连不了它自己绑的socket (详见classifyRemoteSocket), 那正是这条连接要避免的失败.
+// 解释器只打印结果词, 前缀在shell脚本里统一加; 一个都找不到时打none, 调用方退回sshd转发.
+func remoteSocketConnect(path string) string {
+	seconds := strconv.FormatFloat(socketProbeReadTimeout.Seconds(), 'f', 2, 64)
+	script := strings.Join([]string{
+		`[ "$(printf '\134')" = '\' ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
+		"p=$(printf " + shellQuoteSingle(octalEscapes(path)) + ");",
+		`[ -n "$p" ] || { echo ` + socketUnknownMarker + `; exit 0; };`,
+		`for i in python3 python perl; do`,
+		`c=$(command -v "$i" 2>/dev/null) || continue;`,
+		`case "$i" in perl) m=$("$c" -e ` + shellQuoteSingle(perlSocketConnect) + ` "$p" ` + seconds + ` 2>/dev/null);;`,
+		`*) m=$("$c" -c ` + shellQuoteSingle(pythonSocketConnect) + ` "$p" ` + seconds + ` 2>/dev/null);; esac;`,
+		`[ -n "$m" ] && { printf '` + socketConnectPrefix + `%s\n' "$m"; exit 0; };`,
+		`done;`,
+		`echo ` + socketConnectNoneMarker,
+	}, " ")
+	// sh -c只保证脚本体的解释器: 外层命令sshd已交给登录shell, 可能是csh, 详见`remoteSocketForm`.
+	return "sh -c " + shellQuoteSingle(script)
+}
+
+// pythonSocketConnect: 解释器体, 远端命令是单行, 所以用exec配\n把结构写全.
+// 体里只用双引号: 外层shell引用靠单引号, 混用会让引号逐层翻倍.
+// connect的失败靠异常读errno; 读用超时区分被持有与没答话就结束; 全程不发送任何字节.
+var pythonSocketConnect = "exec('" + strings.Join([]string{
+	`import errno,socket,sys`,
+	`p=sys.argv[1]`,
+	`s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)`,
+	`s.settimeout(float(sys.argv[2]))`,
+	`try:`,
+	` s.connect(p)`,
+	`except Exception as e:`,
+	` n=getattr(e,"errno",None)`,
+	` print("` + socketConnectRefusedWord + `" if n==errno.ECONNREFUSED else "` + socketConnectAbsentWord + `" if n==errno.ENOENT else "` + socketConnectOtherWord + `-%s"%n)`,
+	` sys.exit(0)`,
+	`try:`,
+	` d=s.recv(64)`,
+	` print("` + socketConnectSpokeWord + `" if d else "` + socketConnectClosedWord + `")`,
+	`except Exception as e:`,
+	` print("` + socketConnectHeldWord + `" if isinstance(e,socket.timeout) else "` + socketConnectOtherWord + `-%s"%getattr(e,"errno",None))`,
+}, `\n`) + "')"
+
+// perlSocketConnect: 上面那条的perl版本, 同样的结果词; sysread返回undef是读错误而非结束.
+var perlSocketConnect = `use Socket;use Errno qw(ECONNREFUSED ENOENT);use IO::Select;socket(S,PF_UNIX,SOCK_STREAM,0) or do{print("` + socketConnectOtherWord + `-".(0+$!)."\n");exit 0};if(connect(S,sockaddr_un($ARGV[0]))){my $sel=IO::Select->new(\*S);if($sel->can_read($ARGV[1])){my $n=sysread(S,my $b,64);print(defined($n)?($n>0?"` + socketConnectSpokeWord + `\n":"` + socketConnectClosedWord + `\n"):"` + socketConnectOtherWord + `-".(0+$!)."\n");}else{print("` + socketConnectHeldWord + `\n");}}else{my $e=0+$!;print($e==ECONNREFUSED?"` + socketConnectRefusedWord + `\n":$e==ENOENT?"` + socketConnectAbsentWord + `\n":"` + socketConnectOtherWord + `-$e\n");}`
 
 // socketForm: 一次性远端命令在路径上看到的结果.
 type socketForm int
@@ -338,6 +407,52 @@ func parseSocketForm(out string) socketForm {
 	return formUnknown
 }
 
+// socketConnectVerdict: 用户域分类命令给出的判定.
+type socketConnectVerdict int
+
+const (
+	// connectNoVerdict: 没有可用的结果词 (解释器不可用, 或输出认不出来); 调用方退回sshd转发那条路.
+	connectNoVerdict socketConnectVerdict = iota
+	// connectRefused: 连接被拒, 没人监听.
+	connectRefused
+	// connectAbsent: 路径已经不在了, 形态检查与分类之间的窗口.
+	connectAbsent
+	// connectHeld: 连上之后一直不答话; 不说话的监听者就是这样, gpg-agent即是.
+	connectHeld
+	// connectSpoke: 连上且答了话, 对面有东西可对话.
+	connectSpoke
+	// connectClosed: 连上后没答话就结束, 与sshd那条路的判决同义.
+	connectClosed
+	// connectOther: 以别的错误结束, 判不了; errno随之带回.
+	connectOther
+)
+
+// parseSocketConnectVerdict: 读分类命令打出的标记行, 整行匹配, 认不出的行 (横幅, 主机跑了别的) 都不算判定.
+// 带errno的那条结果词是多变的, 按前缀读.
+func parseSocketConnectVerdict(out string) (socketConnectVerdict, int) {
+	for _, line := range strings.Split(out, "\n") {
+		word := strings.TrimSpace(line)
+		switch word {
+		case socketConnectPrefix + socketConnectRefusedWord:
+			return connectRefused, 0
+		case socketConnectPrefix + socketConnectAbsentWord:
+			return connectAbsent, 0
+		case socketConnectPrefix + socketConnectHeldWord:
+			return connectHeld, 0
+		case socketConnectPrefix + socketConnectSpokeWord:
+			return connectSpoke, 0
+		case socketConnectPrefix + socketConnectClosedWord:
+			return connectClosed, 0
+		}
+		if rest, ok := strings.CutPrefix(word, socketConnectPrefix+socketConnectOtherWord+"-"); ok {
+			if errno, err := strconv.Atoi(rest); err == nil {
+				return connectOther, errno
+			}
+		}
+	}
+	return connectNoVerdict, 0
+}
+
 // remoteSocketState: 检查在远端路径上看到什么, 又做了什么; 零值就是允许起会话的状态.
 type remoteSocketState int
 
@@ -373,9 +488,9 @@ func (s remoteSocketState) String() string {
 }
 
 // maySkipRemoteCheck: `--skip-remote-check`能否从这个状态起会话.
-// 规则看状态是怎么来的, 不看是哪个状态: 只覆盖"检查根本做不成" (主机问不到, 或没有回答),
-// 路径自身给出的判定不由该flag推翻: 有监听者, 非socket文件, 删不掉的残留都是;
-// 不可写是另一种出路的问题 (换个路径), 因为写权限正是连接socket这个判定成立的前提.
+// 规则看状态是怎么来的, 不看是哪个状态: 只覆盖"检查根本做不成" (主机问不到, 没有回答,
+// 或连接以读不出结论的错误失败), 路径自身给出的判定不由该flag推翻: 有监听者, 非socket文件,
+// 删不掉的残留都是; 不可写是另一种出路的问题 (换个路径), 因为写权限正是连接socket这个判定成立的前提.
 func (s remoteSocketState) maySkipRemoteCheck() bool {
 	return s == socketUnjudgeable
 }
@@ -388,6 +503,17 @@ func probeRemoteSocketForm(sshArgs []string, remoteSocket string, run SSHCommand
 		return formUnknown, err
 	}
 	return parseSocketForm(out), nil
+}
+
+// classifyRemoteSocketInUserDomain: 让远端用户域里的解释器去连remoteSocket, 读它的判定.
+// runner的错误与没有结果词同义, 两者都让调用方退回sshd转发那条路, 详见`CheckRemoteSocketFree`.
+func classifyRemoteSocketInUserDomain(sshArgs []string, remoteSocket string, run SSHCommandRunner) (socketConnectVerdict, int, error) {
+	out, err := run(sshArgs, remoteSocketConnect(remoteSocket))
+	if err != nil {
+		return connectNoVerdict, 0, err
+	}
+	verdict, errno := parseSocketConnectVerdict(out)
+	return verdict, errno, nil
 }
 
 // 分类连接用的`ClearAllForwardings`取值,刻意与一次性查询连接相反:该项全有全无,
@@ -656,9 +782,12 @@ func freeLoopbackPort() (int, error) {
 	return port, nil
 }
 
-// 预检用的分类函数;做成变量便于测试替换判定,无需假ssh即可覆盖调用方各分支;
+// 预检用的两个分类函数;做成变量便于测试替换判定,无需假ssh即可覆盖调用方各分支;
 // 连接本身在`remote_probe_test.go`里用真绑定真连接的假ssh端到端覆盖.
-var classifyRemoteSocketForward = classifyRemoteSocket
+var (
+	classifyRemoteSocketUserDomain = classifyRemoteSocketInUserDomain
+	classifyRemoteSocketForward    = classifyRemoteSocket
+)
 
 // 删除远端remoteSocket并报告是否已消失;两种结果都没报算删除失败,不算成功
 func removeRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRunner) (bool, error) {
@@ -679,9 +808,10 @@ func removeRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRun
 
 // 让sshd即将绑定的远端路径可用,不可用则说明原因.
 // 该路径是gpg找agent的地方:转发到它时,sshd的`StreamLocalBindUnlink`会顶掉那里的活socket占位,
-// gpg便静默连到别的agent,故活socket不覆盖;无人监听的遗留经正向控制确认无人应答后才删.
-// 仅error为nil才放行:`socketReclaimed`是已删遗留,`socketUnjudgeable`与`socketUnwritable`亦拒绝;
-// 哪些状态可被`--skip-remote-check`放行的规则详见`maySkipRemoteCheck`.
+// gpg便静默连到别的agent,故活socket不覆盖;无人监听的遗留经确认无人应答后才删.
+// 确认分两步: 先让远端用户域里的解释器去连 (见`remoteSocketConnect`), 没有解释器可用时才退回
+// 让sshd自己连 (见`checkRemoteSocketByForward`). 仅error为nil才放行:`socketReclaimed`是已删遗留,
+// `socketUnjudgeable`与`socketUnwritable`亦拒绝;哪些状态可被`--skip-remote-check`放行的规则详见`maySkipRemoteCheck`.
 func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommandRunner) (remoteSocketState, error) {
 	form, err := probeRemoteSocketForm(sshArgs, remoteSocket, run)
 	if err != nil {
@@ -693,9 +823,8 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommand
 	case formUnwritable:
 		return socketUnwritable, fmt.Errorf(
 			"%s on the remote host cannot be written by your user there, so whether anything is listening on it cannot be told from here.\n"+
-				"  Connecting to a socket needs write permission on it, and a refused connect reaches this side as a\n"+
-				"  connection that ended - the same thing a socket nothing is listening on looks like. Without the\n"+
-				"  permission the two cannot be told apart, so this tool refuses rather than guess.\n"+
+				"  Connecting to a socket needs write permission on it, and a connect the user may not make says nothing\n"+
+				"  about whether anything is listening: it fails either way, so this tool refuses rather than guess.\n"+
 				"  Do not delete it yourself to get past this: something may be listening on it, and protecting exactly\n"+
 				"  that is why this check exists. First see what is there and who owns it (ls -l %s), and make sure no\n"+
 				"  agent is using it.\n"+
@@ -716,6 +845,34 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommand
 			remoteSocket)
 	}
 
+	// 分类先问远端用户域: 连接者是远端gpg自己所在的域, 拿到的errno就是判决, 不需要阳性对照,
+	// 也不要求sshd能连上自己绑的socket; 详见`remoteSocketConnect`.
+	verdict, errno, _ := classifyRemoteSocketUserDomain(sshArgs, remoteSocket, run)
+	switch verdict {
+	case connectAbsent:
+		return socketFree, nil
+	case connectRefused, connectClosed:
+		return reclaimRemoteSocket(sshArgs, remoteSocket, run)
+	case connectHeld, connectSpoke:
+		return socketLive, liveSocketError(remoteSocket)
+	case connectOther:
+		return socketUnjudgeable, fmt.Errorf(
+			"your user on the remote host could not connect to %s (errno %d from that host), so whether anything is\n"+
+				"  listening on it cannot be told from here. A user whose SELinux domain may not reach the socket, a listener\n"+
+				"  that accepts nothing, and a socket that changed under the check all look like this; nothing was removed.\n"+
+				"  Do not delete it yourself to get past this: something may be listening on it. First see what is there\n"+
+				"  (ls -l %s) and make sure no agent is using it.\n"+
+				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
+			remoteSocket, errno, shellQuoteSingle(remoteSocket))
+	}
+	// connectNoVerdict: 远端没有解释器能回报, 或它什么都没打出来; 退回sshd转发那条路.
+	return checkRemoteSocketByForward(sshArgs, remoteSocket, run)
+}
+
+// checkRemoteSocketByForward: 退回路径: 让远端sshd经stream-local转发自己连那个路径, 用正向控制兜住
+// "转发被拒"与"没人监听"无法区分这一点 (详见`remoteSocketForm`的文档).
+// 控制socket是与被测路径同目录的自建socket, 存在SELinux一类加固时sshd连不了它, 于是这条路判不出来.
+func checkRemoteSocketByForward(sshArgs []string, remoteSocket string, run SSHCommandRunner) (remoteSocketState, error) {
 	control, err := controlSocketPath(remoteSocket)
 	if err != nil {
 		return socketUnjudgeable, fmt.Errorf("could not tell whether %s on the remote host is in use: %w", remoteSocket, err)
@@ -726,42 +883,23 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommand
 	removeRemoteSocketBestEffort(sshArgs, control, run)
 	if err != nil {
 		return socketUnjudgeable, fmt.Errorf(
-			"could not tell whether %s on the remote host is in use: %v.\n"+
-				"  The check works by having that host connect to the path, through a socket it creates next to it and then\n"+
-				"  removes; that connection is what could not be made. It needs stream-local forwarding in both directions - a\n"+
-				"  socket the host creates next to the path on that host, and a connect the host makes - so an sshd\n"+
-				"  that restricts it (AllowStreamLocalForwarding no, local or remote, or PermitOpen limits on the\n"+
-				"  connect) refuses one of them, and a refusal is indistinguishable from a socket nothing is listening\n"+
-				"  on, so nothing was removed.\n"+
+			"could not tell whether %s on the remote host is in use: nothing on that host reported on the path through\n"+
+				"  the user-domain check (no python3, python or perl found, or the command did not run), and the fallback\n"+
+				"  that has the host's own sshd connect to it did not report either: %v.\n"+
+				"  That fallback creates a socket next to the path and has the host connect to it, twice; it needs\n"+
+				"  stream-local forwarding in both directions, so an sshd that restricts it (AllowStreamLocalForwarding\n"+
+				"  no, local or remote, or PermitOpen limits on the connect) refuses one of them, and so does an sshd\n"+
+				"  that its own SELinux policy stops from connecting to sockets it bound itself (Fedora's sshd_session_t\n"+
+				"  cannot connect to sshd_session_t sockets). A refusal is indistinguishable from a socket nothing is\n"+
+				"  listening on, so nothing was removed.\n"+
 				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
 			remoteSocket, err)
 	}
 	switch verdict {
 	case forwardLive:
-		return socketLive, fmt.Errorf(
-			"%s already exists on the remote host, so it is in use by that host's own gpg-agent.\n"+
-				"  Forwarding onto it would make gpg talk to the remote agent instead of the Windows one.\n"+
-				"  Stop the remote agent first:\n"+
-				"      gpgconf --kill gpg-agent\n"+
-				"      echo no-autostart >> ~/.gnupg/gpg.conf\n"+
-				"  (and remove the leftover socket if it survives: rm -f -- %s)\n"+
-				"  Pass --remote-socket PATH to use a different path instead.",
-			remoteSocket, shellQuoteSingle(remoteSocket))
+		return socketLive, liveSocketError(remoteSocket)
 	case forwardDead:
-		removed, err := removeRemoteSocket(sshArgs, remoteSocket, run)
-		if err != nil {
-			return socketStuck, fmt.Errorf(
-				"a socket nothing is listening on is left at %s on the remote host, and removing it failed: %v.\n"+
-					"  Remove it there, or pass --remote-socket PATH to use a different path.",
-				remoteSocket, err)
-		}
-		if !removed {
-			return socketStuck, fmt.Errorf(
-				"a socket nothing is listening on is left at %s on the remote host, and it could not be removed.\n"+
-					"  Remove it there, or pass --remote-socket PATH to use a different path.",
-				remoteSocket)
-		}
-		return socketReclaimed, nil
+		return reclaimRemoteSocket(sshArgs, remoteSocket, run)
 	default: // forwardUnjudgeable:没有得到关于该路径的判定
 		return socketUnjudgeable, fmt.Errorf(
 			"could not tell whether %s on the remote host is in use: the check could not make its connection.\n"+
@@ -769,6 +907,37 @@ func CheckRemoteSocketFree(sshArgs []string, remoteSocket string, run SSHCommand
 				"  Pass --skip-remote-check to start the session anyway, or --remote-socket PATH to use a different path.",
 			remoteSocket)
 	}
+}
+
+// reclaimRemoteSocket: 删掉判定为遗留的socket; 删不掉就不放行, 路径上还挡着东西.
+func reclaimRemoteSocket(sshArgs []string, remoteSocket string, run SSHCommandRunner) (remoteSocketState, error) {
+	removed, err := removeRemoteSocket(sshArgs, remoteSocket, run)
+	if err != nil {
+		return socketStuck, fmt.Errorf(
+			"a socket nothing is listening on is left at %s on the remote host, and removing it failed: %v.\n"+
+				"  Remove it there, or pass --remote-socket PATH to use a different path.",
+			remoteSocket, err)
+	}
+	if !removed {
+		return socketStuck, fmt.Errorf(
+			"a socket nothing is listening on is left at %s on the remote host, and it could not be removed.\n"+
+				"  Remove it there, or pass --remote-socket PATH to use a different path.",
+			remoteSocket)
+	}
+	return socketReclaimed, nil
+}
+
+// liveSocketError: 路径上有监听者时不放行的说明; 两条分类路都给出同一个判定.
+func liveSocketError(remoteSocket string) error {
+	return fmt.Errorf(
+		"%s already exists on the remote host, so it is in use by that host's own gpg-agent.\n"+
+			"  Forwarding onto it would make gpg talk to the remote agent instead of the Windows one.\n"+
+			"  Stop the remote agent first:\n"+
+			"      gpgconf --kill gpg-agent\n"+
+			"      echo no-autostart >> ~/.gnupg/gpg.conf\n"+
+			"  (and remove the leftover socket if it survives: rm -f -- %s)\n"+
+			"  Pass --remote-socket PATH to use a different path instead.",
+		remoteSocket, shellQuoteSingle(remoteSocket))
 }
 
 // 删除path并丢弃判定与失败;用于控制socket,它是本检查自己的资源,不是判定的对象:

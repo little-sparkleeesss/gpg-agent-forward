@@ -40,6 +40,115 @@ func withClassification(t *testing.T, verdict socketForwardVerdict, err error) {
 	t.Cleanup(func() { classifyRemoteSocketForward = old })
 }
 
+// 替换用户域分类的结论; 走到sshd那条路的用例靠它给connectNoVerdict.
+func withUserDomainClassification(t *testing.T, verdict socketConnectVerdict, errno int, err error) {
+	t.Helper()
+	old := classifyRemoteSocketUserDomain
+	classifyRemoteSocketUserDomain = func([]string, string, SSHCommandRunner) (socketConnectVerdict, int, error) {
+		return verdict, errno, err
+	}
+	t.Cleanup(func() { classifyRemoteSocketUserDomain = old })
+}
+
+// 用户域的判定就是判决本身: 每种结果直接映射状态, 只有"没有结果词"才退回sshd转发.
+func TestCheckRemoteSocketFreeUsesTheUserDomainVerdict(t *testing.T) {
+	const socket = "/run/user/1000/gnupg/S.gpg-agent"
+	cases := []struct {
+		name      string
+		verdict   socketConnectVerdict
+		errno     int
+		wantState remoteSocketState
+		wantError bool
+		wantHint  string
+	}{
+		{"a leftover", connectRefused, 0, socketReclaimed, false, ""},
+		{"a socket that ends without a word", connectClosed, 0, socketReclaimed, false, ""},
+		{"a path that is not there any more", connectAbsent, 0, socketFree, false, ""},
+		{"a live socket", connectHeld, 0, socketLive, true, "no-autostart"},
+		{"a socket that greets", connectSpoke, 0, socketLive, true, "no-autostart"},
+		{"an error the check cannot read", connectOther, 13, socketUnjudgeable, true, "--skip-remote-check"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withUserDomainClassification(t, tc.verdict, tc.errno, nil)
+			state, err := CheckRemoteSocketFree([]string{"host"}, socket,
+				runFormThenRemoval(socketSocketMarker, socketReclaimedMarker))
+			if state != tc.wantState {
+				t.Errorf("state = %v, want %v", state, tc.wantState)
+			}
+			if (err != nil) != tc.wantError {
+				t.Fatalf("error = %v, wantError %v", err, tc.wantError)
+			}
+			if tc.wantHint != "" && !strings.Contains(err.Error(), tc.wantHint) {
+				t.Errorf("error %v should name %s", err, tc.wantHint)
+			}
+			if tc.verdict == connectOther && !strings.Contains(err.Error(), "13") {
+				t.Errorf("error %v should carry the errno the host gave", err)
+			}
+		})
+	}
+}
+
+// 用户域那步给不出判定 (没有解释器, 或它什么都没打出来) 时才走sshd转发; 那条路仍然有效,
+// 所以主路判不了不等于检查做不成.
+func TestCheckRemoteSocketFreeFallsBackToTheForwardingCheck(t *testing.T) {
+	var commands []string
+	run := func(_ []string, remoteCommand string) (string, error) {
+		commands = append(commands, remoteCommand)
+		if strings.Contains(remoteCommand, "rm -f") && !isControlSocketRemoval(t, remoteCommand) {
+			return socketReclaimedMarker + "\n", nil
+		}
+		return socketSocketMarker + "\n", nil
+	}
+	withUserDomainClassification(t, connectNoVerdict, 0, nil)
+	withClassification(t, forwardDead, nil)
+
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", run)
+	if err != nil {
+		t.Fatalf("CheckRemoteSocketFree() error = %v, want the fallback to reclaim the leftover", err)
+	}
+	if state != socketReclaimed {
+		t.Errorf("state = %v, want socketReclaimed", state)
+	}
+	// 判定的来源必须是那条路: 删除命令跑过, 且删的是被测路径而不是控制socket.
+	var removals int
+	for _, c := range commands {
+		if strings.Contains(c, "rm -f") && !isControlSocketRemoval(t, c) {
+			removals++
+		}
+	}
+	if removals != 1 {
+		t.Errorf("removals of the path under test = %d, want the fallback's verdict to reclaim it once", removals)
+	}
+}
+
+// 用户域给出判决时不该再碰sshd那条路: 少一条连接, 也少一个旁边的控制socket.
+func TestCheckRemoteSocketFreeLeavesTheForwardingPathAloneWhenTheUserDomainDecides(t *testing.T) {
+	var commands []string
+	run := func(_ []string, remoteCommand string) (string, error) {
+		commands = append(commands, remoteCommand)
+		if strings.Contains(remoteCommand, "rm -f") {
+			return socketReclaimedMarker + "\n", nil
+		}
+		return socketSocketMarker + "\n", nil
+	}
+	withUserDomainClassification(t, connectRefused, 0, nil)
+	withClassification(t, forwardUnjudgeable, errors.New("the forwarding check must not be reached"))
+
+	state, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", run)
+	if err != nil {
+		t.Fatalf("CheckRemoteSocketFree() error = %v, want the leftover reclaimed from the user-domain verdict", err)
+	}
+	if state != socketReclaimed {
+		t.Errorf("state = %v, want socketReclaimed", state)
+	}
+	for _, c := range commands {
+		if isControlSocketRemoval(t, c) {
+			t.Errorf("a control socket was created and removed although the user-domain verdict decided: %s", c)
+		}
+	}
+}
+
 func TestCheckRemoteSocketFreeAcceptsAFreePath(t *testing.T) {
 	// 路径上什么都没有才是健康: 不存在的路径后面不可能有监听者, sshd的绑定可取用它.
 	if _, err := CheckRemoteSocketFree([]string{"host"}, "/run/user/1000/gnupg/S.gpg-agent", runForm(socketAbsentMarker)); err != nil {

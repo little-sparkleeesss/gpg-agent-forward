@@ -38,9 +38,10 @@ func discoveryAnnouncedMarker(f *standInSSH) string {
 	return f.log + ".discovery-announced"
 }
 
-// 替身ssh对run的四种调用分别作答: 带`gpgconf`的discovery查询只在run通报到`stderr`
+// 替身ssh对run的五种调用分别作答: 带`gpgconf`的discovery查询只在run通报到`stderr`
 // 之后才回`standInRemoteSocketPath`; 删除分两条: control socket回`socketReclaimedMarker`,
-// 被测路径回`removalMarker`; 带`socketAbsentMarker`的form命令回`formMarker`, 其余是session.
+// 被测路径回`removalMarker`; 带`socketAbsentMarker`的form命令回`formMarker`;
+// 带`command -v`的用户域分类命令回none (这些用例测的是退回sshd转发之后的调用方行为), 其余是session.
 func newStandInSSHForForm(t *testing.T, formMarker, removalMarker string) *standInSSH {
 	t.Helper()
 	dir := t.TempDir()
@@ -81,6 +82,10 @@ case "$*" in
         ;;
     esac
     ;;
+  *command\ -v*)
+    echo connect >> %s
+    echo %s
+    ;;
   *)
     echo session >> %s
     : > %s
@@ -92,6 +97,7 @@ esac
 		socketAbsentMarker, shellQuoteSingle(f.log), form,
 		casePatternFor(octalEscapes("/"+controlSocketPrefix)), shellQuoteSingle(f.log), socketReclaimedMarker,
 		shellQuoteSingle(f.log), removal,
+		shellQuoteSingle(f.log), socketConnectNoneMarker,
 		shellQuoteSingle(f.log), shellQuoteSingle(f.started))
 	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
 		t.Fatalf("write the stand-in ssh: %v", err)
@@ -202,7 +208,7 @@ func TestRunSSHRefusesALiveSocketWhateverTheFlagSays(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run(ssh) error = nil, want a refusal for a live socket even with --skip-remote-check")
 	}
-	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake), want) {
+	if want := []string{"probe", "connect"}; !slices.Equal(checkInvocations(t, fake), want) {
 		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
 	}
 }
@@ -222,7 +228,7 @@ func TestRunSSHStartsAfterReclaimingALeftover(t *testing.T) {
 		t.Fatalf("Run(ssh) error = %v, want the session to run; diagnostics: %q", err, errOut)
 	}
 	// 两次删除是设计使然: 一次删被测路径, 一次删检查自己建的控制socket.
-	if want := []string{"probe", "remove", "session"}; !slices.Equal(checkInvocations(t, fake), want) {
+	if want := []string{"probe", "connect", "remove", "session"}; !slices.Equal(checkInvocations(t, fake), want) {
 		t.Errorf("ssh invocations = %q, want %q", checkInvocations(t, fake), want)
 	}
 	if !strings.Contains(errOut, "removed a leftover socket") {
@@ -257,7 +263,7 @@ func TestRunSSHAnnouncesTheDiscoveryConnectionBeforeItRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run(ssh) error = %v, want the session to run; diagnostics: %q", err, diagnostics.String())
 	}
-	want := []string{"query", "probe", "remove", "session"}
+	want := []string{"query", "probe", "connect", "remove", "session"}
 	if got := checkInvocations(t, fake); !slices.Equal(got, want) {
 		t.Errorf("ssh invocations = %q, want %q", got, want)
 	}
@@ -296,7 +302,7 @@ func TestRunSSHStopsWhenTheLeftoverCannotBeRemoved(t *testing.T) {
 		t.Fatal("Run(ssh) error = nil, want a refusal when the leftover could not be removed")
 	}
 	// 答案来自那次删除尝试; session不会跟着打开.
-	if want := []string{"probe", "remove"}; !slices.Equal(checkInvocations(t, fake), want) {
+	if want := []string{"probe", "connect", "remove"}; !slices.Equal(checkInvocations(t, fake), want) {
 		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
 	}
 }
@@ -336,7 +342,7 @@ func TestRunSSHStopsWhenTheClassificationCannotBeMade(t *testing.T) {
 	if !strings.Contains(err.Error(), "--skip-remote-check") {
 		t.Errorf("error %v should name --skip-remote-check as the way to start anyway", err)
 	}
-	if want := []string{"probe"}; !slices.Equal(checkInvocations(t, fake), want) {
+	if want := []string{"probe", "connect"}; !slices.Equal(checkInvocations(t, fake), want) {
 		t.Errorf("ssh invocations = %q, want %q: the session must not open", checkInvocations(t, fake), want)
 	}
 
@@ -348,7 +354,7 @@ func TestRunSSHStopsWhenTheClassificationCannotBeMade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run(ssh) error = %v, want the session to run; diagnostics: %q", err, errOut)
 	}
-	if want := []string{"probe", "session"}; !slices.Equal(checkInvocations(t, fake2), want) {
+	if want := []string{"probe", "connect", "session"}; !slices.Equal(checkInvocations(t, fake2), want) {
 		t.Errorf("ssh invocations = %q, want %q", checkInvocations(t, fake2), want)
 	}
 	if !strings.Contains(errOut, "--skip-remote-check") || !strings.Contains(errOut, "starting without a verdict") {
